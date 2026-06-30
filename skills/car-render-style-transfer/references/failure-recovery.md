@@ -1,0 +1,70 @@
+# Failure Recovery
+
+Use this only after auditing candidates with the worksheet. Do not recover by editing a generated candidate. Restart every retry from the original `SOURCE_IMAGE`, accepted `CONTROL_LINE_IMAGE`, and `STYLE_REFERENCE_IMAGE`.
+
+Before each retry, update the job record with `retry_number`, `failure_category`, `failed_quality_gates`, `changed_parameter_group`, and `next_action`. Change exactly one parameter group per retry unless the control line itself failed.
+
+## Retry Ladder
+
+- **R0 baseline**: selected profile, normal prompt.
+- **R1 targeted correction**: keep the same profile and change exactly one failed parameter group.
+- **R2 profile correction**: switch to a stricter profile, usually `fidelity-lock` or `strict-green-cutout`.
+- **R3 control correction**: regenerate or replace `CONTROL_LINE_IMAGE`; consider hybrid control if geometry still drifts.
+
+Do not change structure language, paint target, lighting, background, and composition all at once. That makes the result non-diagnostic.
+
+## Failure Table
+
+| Failure | Likely cause | Next action |
+|---|---|---|
+| Vehicle becomes another model | style reference is influencing geometry | restart from original inputs; switch to `fidelity-lock`; reduce `style_strength`; add 5-8 specific source-lock facts |
+| Front fascia or lamps change | prompt under-specified fine details or control line too simplified | strengthen fascia/lamp facts; use source image for fine details; regenerate control line if needed |
+| Wheels move, resize, or change design | control line failed or style borrowed stance | audit wheel centers and wheel arch relation; repeat exact wheel facts; reduce style strength |
+| Crop/camera drifts | contradictory composition instructions | choose one composition mode only; remove reference-camera language if source crop should win |
+| Reference car shape leaks in | style reference not role-limited | explicitly state style reference controls lighting/material only; forbid borrowing body shape, wheels, fascia, lamps, crop |
+| Paint too bright or washed out | highlights raised midtones | keep highlight intensity but lower midtones/shadows by half a stop |
+| Silver turns purple | hue drift near HSB 240 | target HSB H=216, S=10; explicitly avoid purple/violet hue |
+| Paint becomes green-tinted | green background interpreted as lighting/environment | repeat flat 2D color-plate rule; forbid green reflections/spill on body, glass, wheels, tires, trim |
+| Background becomes green room/floor | model treats green as physical scene | use `strict-green-cutout`; say no floor, horizon, cyclorama, lit surface, or ground plane |
+| Ground reflection streaks appear | floor/environment reflections leaking into paint | forbid floor texture, horizontal ground streaks, wavy reflected ground lines; use neutral studio bands only |
+| Details disappear | line control used without source-detail restoration | add detail rule: restore lamp internals, grille texture, wheel spokes, trim, sensors from SOURCE_IMAGE |
+| Output becomes blurry | iterative editing or overconstrained correction | restart from original inputs; do not use generated candidate; keep prompt shorter and profile-based |
+| Batch outputs inconsistent | context contamination or profile drift | isolate one car per call; reuse same profile; store source-lock facts per car; avoid carrying previous failures into next car |
+
+## Targeted Correction Blocks
+
+Use one block per retry.
+
+### Structure Correction
+
+```text
+Correction for this retry: structure drift was detected. Increase structure priority to maximum and reduce style strength. Preserve SOURCE_IMAGE and CONTROL_LINE_IMAGE geometry exactly, especially [failed parts]. STYLE_REFERENCE_IMAGE must not affect body shape, fascia, lamps, wheels, crop, or perspective.
+```
+
+### Paint Correction
+
+```text
+Correction for this retry: paint mismatch was detected. Keep the same source geometry and lighting setup, but adjust only paint color/material toward [target]. Do not change wheel placement, fascia, lamp shapes, crop, camera, or background.
+```
+
+### Green Background Correction
+
+```text
+Correction for this retry: background or green spill failed. Treat #00FF00 as a flat 2D compositing plate only, not a floor, room, cyclorama, environment, or light source. Remove all green reflections and green tint from body, glass, wheels, tires, trim, and lower panels.
+```
+
+### Composition Correction
+
+```text
+Correction for this retry: composition drift was detected. Keep [source/reference-selected] crop, vehicle scale, perspective, and camera feel. Do not change vehicle design, wheel placement, stance, fascia, lamps, or paint target.
+```
+
+### Detail Sharpness Correction
+
+```text
+Correction for this retry: fine details became soft. Restore grille texture, lamp internals, wheel spokes, trim boundaries, sensors, panel gaps, and glass edges from SOURCE_IMAGE while keeping the same style recipe and geometry control.
+```
+
+## Acceptance Rule
+
+Accept a candidate only when all Level-1 structure gates pass and all user-critical gates pass. If only non-critical style gates fail, prefer the structurally correct candidate and run a targeted style retry rather than selecting a visually attractive but structurally wrong candidate.

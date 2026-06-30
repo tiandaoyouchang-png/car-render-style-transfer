@@ -1,0 +1,4 @@
+interface:
+  display_name: "Car Render Style Transfer"
+  short_description: "Stable image-to-image car render transfer"
+  default_prompt: "Use $car-render-style-transfer for this Car Render Style Transfer image-to-image task. Preserve source vehicle geometry with a source-derived control line, use the reference only for paint, lighting, material, and CGI render quality, apply a parameter profile and quality gates, and maintain a job artifact record."
