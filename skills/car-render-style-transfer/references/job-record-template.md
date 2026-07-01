@@ -93,6 +93,7 @@ quality_gate_results:
     side_profile_contrast_local_highlights:
     glass_lower_body_rim_light:
     glass_continuity_no_stripes_blocks_noise:
+    a_pillar_windshield_edge_cleanliness:
     render_sharpness_cgi_polish:
   level_3_background_artifacts:
     requested_background:

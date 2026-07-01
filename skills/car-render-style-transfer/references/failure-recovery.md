@@ -31,6 +31,7 @@ Do not change structure language, paint target, lighting, background, and compos
 | Details disappear | line control used without source-detail restoration | add detail rule: restore lamp internals, grille texture, wheel spokes, trim, sensors from SOURCE_IMAGE |
 | Output becomes blurry | iterative editing or overconstrained correction | restart from original inputs; do not use generated candidate; keep prompt shorter and profile-based |
 | Windshield or glass has black-white stripes, checkerboard blocks, or noisy patches | transparency checkerboard/source noise/control-line texture leaked into glass rendering | restore smooth continuous dark smoked automotive glass; forbid checkerboard, zebra stripes, patchy blocks, pixel noise, white bars, and texture transfer inside glass |
+| A-pillar or windshield edge looks dirty, muddy, smudged, or contaminated | noisy source artifacts or reflection texture collected at the glass/body boundary | clean the A-pillar-to-windshield seam; use crisp black rubber trim and smooth dark glass; forbid dirty gray smears, dust, speckles, blotches, cloudy patches, and muddy edge reflections |
 | Batch outputs inconsistent | context contamination or profile drift | isolate one car per call; reuse same profile; store source-lock facts per car; avoid carrying previous failures into next car |
 
 ## Targeted Correction Blocks
@@ -79,6 +80,12 @@ Correction for this retry: fine details became soft. Restore grille texture, lam
 
 ```text
 Correction for this retry: windshield/glass artifacts were detected. Keep the same source geometry, crop, paint, and lighting style, but render the windshield, side glass, and rear quarter glass as smooth continuous dark smoked automotive glass with subtle clean studio reflections. Do not transfer checkerboard transparency patterns, CAD line texture, source noise, black-white stripes, zebra bands, patchy rectangular blocks, white bars, pixel noise, or speckled artifacts into any glass area.
+```
+
+### A-Pillar / Windshield Edge Cleanup
+
+```text
+Correction for this retry: the A-pillar and windshield edge looked dirty or contaminated. Keep the same source geometry, crop, paint, and lighting style, but clean only the A-pillar-to-windshield boundary. Render the A-pillar as clean painted body/black trim, the windshield edge as crisp black rubber sealing, and the windshield as smooth continuous dark smoked glass. Do not place dirty gray smears, dust, speckles, muddy blotches, cloudy patches, source noise, checkerboard remnants, or busy reflected texture around the A-pillar, windshield edge, mirror base, or front side-window corner.
 ```
 
 ## Acceptance Rule

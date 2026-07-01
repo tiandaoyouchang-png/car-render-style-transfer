@@ -90,7 +90,7 @@ BACKGROUND AND SHADOW
 [shadow requirement]
 
 FORBIDDEN ARTIFACTS
-No green spill, green reflections, ground reflections, floor texture, horizon, cyclorama, lit green room, physical green-screen interpretation, horizontal floor streaks, wavy ground lines, windshield checkerboard, black-white glass stripes, patchy glass blocks, pixel noise in glass, watermarks, readable text, new badges, new logos, or plate writing unless explicitly requested. If style conflicts with source structure, choose source structure.
+No green spill, green reflections, ground reflections, floor texture, horizon, cyclorama, lit green room, physical green-screen interpretation, horizontal floor streaks, wavy ground lines, windshield checkerboard, black-white glass stripes, patchy glass blocks, pixel noise in glass, dirty A-pillar smears, muddy windshield-edge blotches, cloudy glass-boundary patches, watermarks, readable text, new badges, new logos, or plate writing unless explicitly requested. If style conflicts with source structure, choose source structure.
 
 PARAMETERS
 - profile: [selected profile]
@@ -158,6 +158,14 @@ Use when source glass is noisy, transparent-checkerboard-backed, or previous can
 
 ```text
 Smooth continuous dark smoked automotive glass with subtle clean studio reflections and crisp glass edges. Do not show checkerboard transparency patterns, black-white stripes, zebra bands, rectangular patches, white bars, speckled noise, CAD line texture, or blocky artifacts inside the windshield, side windows, or rear quarter glass.
+```
+
+### Clean A-Pillar / Windshield Boundary
+
+Use when the A-pillar, mirror base, or windshield edge looks dirty, cloudy, or over-textured.
+
+```text
+Clean A-pillar-to-windshield boundary: crisp painted A-pillar and black rubber glass seal, smooth continuous dark windshield, clean front side-window corner, and clean mirror-base shadow. Do not show dirty gray smears, dusty speckles, muddy blotches, cloudy patches, checkerboard remnants, or busy reflected texture around the A-pillar, windshield edge, mirror base, or front side-window corner.
 ```
 
 ### Side-Profile High-Contrast Silver

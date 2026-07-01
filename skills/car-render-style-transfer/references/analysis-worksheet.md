@@ -93,6 +93,7 @@ Mark failed items before deciding whether to accept or retry.
 - **Side-profile contrast and local highlight brightness**: pass / fail
 - **Glass darkness / lower-body shading / rim light**: pass / fail
 - **Glass continuity, no stripes/blocks/noise**: pass / fail
+- **A-pillar and windshield-edge cleanliness**: pass / fail
 - **Render sharpness and CGI polish**: pass / fail
 
 ### Level 3: Background / Artifact Gates
