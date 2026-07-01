@@ -90,7 +90,7 @@ BACKGROUND AND SHADOW
 [shadow requirement]
 
 FORBIDDEN ARTIFACTS
-No green spill, green reflections, ground reflections, floor texture, horizon, cyclorama, lit green room, physical green-screen interpretation, horizontal floor streaks, wavy ground lines, watermarks, readable text, new badges, new logos, or plate writing unless explicitly requested. If style conflicts with source structure, choose source structure.
+No green spill, green reflections, ground reflections, floor texture, horizon, cyclorama, lit green room, physical green-screen interpretation, horizontal floor streaks, wavy ground lines, windshield checkerboard, black-white glass stripes, patchy glass blocks, pixel noise in glass, watermarks, readable text, new badges, new logos, or plate writing unless explicitly requested. If style conflicts with source structure, choose source structure.
 
 PARAMETERS
 - profile: [selected profile]
@@ -114,6 +114,12 @@ Use exactly one block.
 ```text
 Background: exact pure solid green #00FF00 / RGB(0,255,0), edge to edge, as a flat 2D compositing color plate. It is not a physical floor, green screen room, cyclorama, lit surface, or environment. No gradient, texture, horizon, floor seam, ground plane, or green light spill.
 Shadow: only a soft neutral contact shadow under tires and chassis, with blurred feathered edges and natural opacity falloff.
+```
+
+Strict pixel wording for difficult retries:
+
+```text
+The background outside the car and shadow must be one uniform flat raster color: #00FF00 / RGB(0,255,0). Do not shade, light, vignette, blur, texture, gradient, or perspective-transform the green background. The green area is not a surface and must not receive shadows or reflections.
 ```
 
 ### Studio Background From Reference
@@ -144,6 +150,14 @@ Cool pearl silver-gray paint, HSB around H=216 and S=10, medium-light midtones a
 
 ```text
 Premium dark studio CGI with controlled high-gloss clearcoat, deep neutral shadows, narrow softbox highlights along roof/hood/shoulder, smoked glass, restrained rim light, and crisp panel definition. Keep midtones controlled so detail does not disappear.
+```
+
+### Clean Smoked Automotive Glass
+
+Use when source glass is noisy, transparent-checkerboard-backed, or previous candidates show stripes/blocks.
+
+```text
+Smooth continuous dark smoked automotive glass with subtle clean studio reflections and crisp glass edges. Do not show checkerboard transparency patterns, black-white stripes, zebra bands, rectangular patches, white bars, speckled noise, CAD line texture, or blocky artifacts inside the windshield, side windows, or rear quarter glass.
 ```
 
 ### Side-Profile High-Contrast Silver

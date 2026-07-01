@@ -90,6 +90,7 @@ Required background wording:
 
 ```text
 Background: exact pure solid green #00FF00 / RGB(0,255,0), edge to edge, as a flat 2D compositing color plate. It is not a physical floor, green screen room, cyclorama, lit surface, environment, or source of green illumination. No gradient, texture, horizon, floor seam, ground plane, or green light spill.
+The background outside the car and shadow must be one uniform flat raster color: #00FF00 / RGB(0,255,0). Do not shade, light, vignette, blur, texture, gradient, or perspective-transform the green background. The green area is not a surface and must not receive shadows or reflections.
 ```
 
 ## batch-silver-green

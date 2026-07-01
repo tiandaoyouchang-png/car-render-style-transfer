@@ -41,7 +41,7 @@ Composition requirements:
 - preserve the source vehicle's original position, scale, and empty-space distribution unless the user explicitly requests normalized framing
 - do not normalize vehicle size
 - do not enlarge a small source vehicle into a full-frame vehicle unless requested
-- do not render the car too small
+- if the source vehicle is small in frame or has large empty space, preserve that scale and empty-space distribution
 - keep the original 3D perspective and composition logic
 - make it suitable as a structural control drawing
 
@@ -87,5 +87,5 @@ Reject and regenerate the control line if any of these fail:
 - wheel design or spoke layout was simplified beyond recognition
 - windows, A/B/C pillars, mirrors, roof modules, door seams, trim, or panel gaps drifted
 - linework looks sketchy, illustrative, shaded, colored, noisy, or over-cleaned
-- vehicle is too small or surrounded by excessive empty space
+- vehicle scale, position, or empty-space distribution differs from the source
 - vehicle was enlarged, normalized, or re-cropped when source scale/crop should be preserved

@@ -92,6 +92,7 @@ quality_gate_results:
     highlight_placement_softness:
     side_profile_contrast_local_highlights:
     glass_lower_body_rim_light:
+    glass_continuity_no_stripes_blocks_noise:
     render_sharpness_cgi_polish:
   level_3_background_artifacts:
     requested_background:

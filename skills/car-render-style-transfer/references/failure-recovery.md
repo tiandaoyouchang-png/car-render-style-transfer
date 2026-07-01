@@ -26,10 +26,11 @@ Do not change structure language, paint target, lighting, background, and compos
 | Contrast too low or highlights too dim | prompt raised style softly but did not specify local specular bands | add `side-profile-highlight` overlay; increase local silver-blue specular bands; deepen adjacent cool blue-gray shadows; do not raise global exposure |
 | Silver turns purple | hue drift near HSB 240 | target HSB H=216, S=10; explicitly avoid purple/violet hue |
 | Paint becomes green-tinted | green background interpreted as lighting/environment | repeat flat 2D color-plate rule; forbid green reflections/spill on body, glass, wheels, tires, trim |
-| Background becomes green room/floor | model treats green as physical scene | use `strict-green-cutout`; say no floor, horizon, cyclorama, lit surface, or ground plane |
+| Background becomes green room/floor or green gradient | model treats green as physical scene or lighting plate | use `strict-green-cutout`; require one uniform flat raster #00FF00 background pixel value; say no floor, horizon, cyclorama, lit surface, gradient, vignette, or ground plane |
 | Ground reflection streaks appear | floor/environment reflections leaking into paint | forbid floor texture, horizontal ground streaks, wavy reflected ground lines; use neutral studio bands only |
 | Details disappear | line control used without source-detail restoration | add detail rule: restore lamp internals, grille texture, wheel spokes, trim, sensors from SOURCE_IMAGE |
 | Output becomes blurry | iterative editing or overconstrained correction | restart from original inputs; do not use generated candidate; keep prompt shorter and profile-based |
+| Windshield or glass has black-white stripes, checkerboard blocks, or noisy patches | transparency checkerboard/source noise/control-line texture leaked into glass rendering | restore smooth continuous dark smoked automotive glass; forbid checkerboard, zebra stripes, patchy blocks, pixel noise, white bars, and texture transfer inside glass |
 | Batch outputs inconsistent | context contamination or profile drift | isolate one car per call; reuse same profile; store source-lock facts per car; avoid carrying previous failures into next car |
 
 ## Targeted Correction Blocks
@@ -58,18 +59,26 @@ Correction for this retry: the side-view render looked too flat and the body hig
 
 ```text
 Correction for this retry: background or green spill failed. Treat #00FF00 as a flat 2D compositing plate only, not a floor, room, cyclorama, environment, or light source. Remove all green reflections and green tint from body, glass, wheels, tires, trim, and lower panels.
+The background outside the car and shadow must be one uniform flat raster color: #00FF00 / RGB(0,255,0). Do not shade, light, vignette, blur, texture, gradient, or perspective-transform the green background. The green area is not a surface and must not receive shadows or reflections.
 ```
 
 ### Composition Correction
 
 ```text
 Correction for this retry: composition drift was detected. Keep [source/reference-selected] crop, vehicle scale, perspective, and camera feel. Do not change vehicle design, wheel placement, stance, fascia, lamps, or paint target.
+If the source vehicle is small in frame or surrounded by large empty space, preserve that source scale and empty-space distribution unless the user explicitly requests normalized framing.
 ```
 
 ### Detail Sharpness Correction
 
 ```text
-Correction for this retry: fine details became soft. Restore grille texture, lamp internals, wheel spokes, trim boundaries, sensors, panel gaps, and glass edges from SOURCE_IMAGE while keeping the same style recipe and geometry control.
+Correction for this retry: fine details became soft. Restore grille texture, lamp internals, wheel spokes, trim boundaries, sensors, panel gaps, handles, roof rails, tire edges, brake calipers, and glass edges from SOURCE_IMAGE while keeping the same style recipe and geometry control. Use crisp high-resolution CGI edges and readable automotive details, not painterly blur, low-resolution smoothing, or softened linework.
+```
+
+### Glass Artifact Correction
+
+```text
+Correction for this retry: windshield/glass artifacts were detected. Keep the same source geometry, crop, paint, and lighting style, but render the windshield, side glass, and rear quarter glass as smooth continuous dark smoked automotive glass with subtle clean studio reflections. Do not transfer checkerboard transparency patterns, CAD line texture, source noise, black-white stripes, zebra bands, patchy rectangular blocks, white bars, pixel noise, or speckled artifacts into any glass area.
 ```
 
 ## Acceptance Rule
