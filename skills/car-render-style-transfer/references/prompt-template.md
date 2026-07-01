@@ -146,6 +146,14 @@ Cool pearl silver-gray paint, HSB around H=216 and S=10, medium-light midtones a
 Premium dark studio CGI with controlled high-gloss clearcoat, deep neutral shadows, narrow softbox highlights along roof/hood/shoulder, smoked glass, restrained rim light, and crisp panel definition. Keep midtones controlled so detail does not disappear.
 ```
 
+### Side-Profile High-Contrast Silver
+
+Use for side-view or near-side-profile vehicles that look flat or under-highlighted.
+
+```text
+Side-profile high-contrast cool silver CGI paint: keep overall midtones controlled and slightly darker than bright white, while adding brighter clean silver-blue specular bands along the hood crown, upper shoulder line, beltline, window lower edge, side-door curvature, fender crowns, wheel arch lips, and rocker-to-door transition. Deepen adjacent cool blue-gray shadows on the lower doors, side skirts, wheel arches, and underbody so the high points read brighter. Do not globally raise exposure, do not wash out lamps, panel gaps, wheel spokes, orange brake calipers, or source design details.
+```
+
 ### Catalog Soft Studio
 
 ```text

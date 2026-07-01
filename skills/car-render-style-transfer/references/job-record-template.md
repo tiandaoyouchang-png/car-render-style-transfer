@@ -90,6 +90,7 @@ quality_gate_results:
     paint_hue_saturation_brightness:
     paint_material_gloss:
     highlight_placement_softness:
+    side_profile_contrast_local_highlights:
     glass_lower_body_rim_light:
     render_sharpness_cgi_polish:
   level_3_background_artifacts:

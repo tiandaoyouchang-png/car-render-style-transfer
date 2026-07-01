@@ -90,6 +90,7 @@ Mark failed items before deciding whether to accept or retry.
 - **Paint hue / saturation / brightness**: pass / fail
 - **Paint material and gloss**: pass / fail
 - **Highlight placement and softness**: pass / fail
+- **Side-profile contrast and local highlight brightness**: pass / fail
 - **Glass darkness / lower-body shading / rim light**: pass / fail
 - **Render sharpness and CGI polish**: pass / fail
 

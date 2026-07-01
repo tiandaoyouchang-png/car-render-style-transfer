@@ -56,6 +56,23 @@ Recommended paint wording:
 Strongly match the reference's lighting contrast, paint finish, softbox highlight shape, glass darkness, and premium CGI rendering quality, while preserving the source vehicle structure exactly.
 ```
 
+## side-profile-highlight
+
+Use when a side-view or near-side-profile car output keeps structure but looks flat, low-contrast, or lacks bright body highlights. This is an overlay profile: combine it with `balanced-style`, `fidelity-lock`, `strict-green-cutout`, or `batch-silver-green` rather than replacing the base profile.
+
+- `structure_priority`: keep the base profile value
+- `style_strength`: keep the base profile value
+- `lighting_strength`: medium to high
+- `gloss_strength`: medium to high
+- `composition`: keep source/control crop, camera, wheelbase, side profile, and vehicle scale
+- Prompt emphasis: raise specular highlight contrast locally, not global exposure.
+
+Required side-view contrast wording:
+
+```text
+Increase side-profile paint contrast without making the whole car brighter. Keep midtones controlled and slightly darker than bright white, but add brighter clean silver-blue specular highlight bands along the hood crown, upper shoulder line, beltline, window lower edge, door curvature, front/rear fender crowns, wheel arch lips, and rocker-to-door transition. Deepen adjacent cool blue-gray shadows under the beltline, lower doors, side skirts, wheel arches, and underbody so the highlights read brighter. Do not wash out panel gaps, lamps, wheel spokes, or source design details.
+```
+
 ## strict-green-cutout
 
 Use when the final image must be composited cleanly or the user requests a pure green background.
