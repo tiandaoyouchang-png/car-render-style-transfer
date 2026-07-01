@@ -77,6 +77,9 @@ Use STYLE_REFERENCE_IMAGE only as this render recipe:
 - shadow behavior: [glass darkness, lower-body shading, contrast, cool/warm temperature]
 - camera/composition target: [keep source crop/camera OR match selected reference composition fields]
 
+PAINT LUMINANCE CALIBRATION
+[measured HSB_B and L* target ranges from STYLE_REFERENCE_IMAGE, if consistency matters]
+
 PAINT AND MATERIAL
 [paint target and profile wording]
 Keep paint controlled and source-geometry-consistent. Preserve source panel boundaries and reflections as neutral automotive studio bands. Avoid unintended hue shifts, especially purple/violet or green-tinted reflections.
@@ -145,6 +148,14 @@ Use these as wording patterns, not fixed defaults.
 
 ```text
 Cool pearl silver-gray paint, HSB around H=216 and S=10, medium-light midtones about half a stop darker than bright white. Satin-gloss clearcoat, soft silver-blue roof/hood highlights, broad neutral cool-gray studio reflection bands, dark blue-gray lower-body shading, no purple/violet shift and no green tint.
+```
+
+### Measured Paint Luminance Calibration
+
+Use when matching the current style reference paint brightness across one or more cars.
+
+```text
+Match this STYLE_REFERENCE_IMAGE's measured paint luminance distribution: dark painted shadows HSB_B [shadow_B_min]-[shadow_B_max], controlled midtones HSB_B [midtone_B_min]-[midtone_B_max], main highlights HSB_B [highlight_B_min]-[highlight_B_max], and only narrow brightest accent highlights HSB_B [accent_B_min]-[accent_B_max]. Keep L* roughly [shadow_L_min]-[shadow_L_max] in painted shadows, [midtone_L_min]-[midtone_L_max] in midtones, [highlight_L_min]-[highlight_L_max] in main highlights, and [accent_L_min]-[accent_L_max] only on small specular accents. Do not make the whole vehicle bright white, do not flatten contrast, and do not let broad panels exceed the measured reference highlight range.
 ```
 
 ### Dark Studio Gloss

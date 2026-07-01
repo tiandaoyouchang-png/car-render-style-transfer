@@ -23,6 +23,7 @@ Do not change structure language, paint target, lighting, background, and compos
 | Crop/camera drifts | contradictory composition instructions | choose one composition mode only; remove reference-camera language if source crop should win |
 | Reference car shape leaks in | style reference not role-limited | explicitly state style reference controls lighting/material only; forbid borrowing body shape, wheels, fascia, lamps, crop |
 | Paint too bright or washed out | highlights raised midtones | keep highlight intensity but lower midtones/shadows by half a stop |
+| Paint brightness inconsistent across cars | prompt lacks measured reference luminance range | use paint calibration; match dark shadows, midtones, main highlights, and narrow brightest accents to the reference HSB_B/L* ranges |
 | Contrast too low or highlights too dim | prompt raised style softly but did not specify local specular bands | add `side-profile-highlight` overlay; increase local silver-blue specular bands; deepen adjacent cool blue-gray shadows; do not raise global exposure |
 | Silver turns purple | hue drift near HSB 240 | target HSB H=216, S=10; explicitly avoid purple/violet hue |
 | Paint becomes green-tinted | green background interpreted as lighting/environment | repeat flat 2D color-plate rule; forbid green reflections/spill on body, glass, wheels, tires, trim |
@@ -49,6 +50,12 @@ Correction for this retry: structure drift was detected. Increase structure prio
 
 ```text
 Correction for this retry: paint mismatch was detected. Keep the same source geometry and lighting setup, but adjust only paint color/material toward [target]. Do not change wheel placement, fascia, lamp shapes, crop, camera, or background.
+```
+
+### Paint Luminance Calibration Correction
+
+```text
+Correction for this retry: paint brightness distribution did not match the reference. Keep the same source geometry, crop, camera, hue, saturation, and background. Adjust only paint luminance: dark painted shadows should stay in [HSB_B / L* shadow range], controlled midtones in [HSB_B / L* midtone range], main highlights in [HSB_B / L* highlight range], and only narrow specular accents in [HSB_B / L* brightest range]. Do not globally brighten the whole car and do not flatten the contrast.
 ```
 
 ### Contrast / Highlight Correction

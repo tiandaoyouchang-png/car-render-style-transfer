@@ -41,6 +41,18 @@ Write only style facts that may transfer. Do not include reference-vehicle geome
 - **Camera/composition facts selected for transfer, if any**:
 - **Reference facts that must not transfer**:
 
+## Paint Luminance Calibration
+
+Fill this when paint consistency matters. Use `references/paint-calibration.md`.
+
+- **Reference calibration source**:
+- **Dark painted shadows HSB_B / L***:
+- **Controlled midtones HSB_B / L***:
+- **Main silver highlights HSB_B / L***:
+- **Brightest accent highlights HSB_B / L***:
+- **Where highlights should appear on this source car**:
+- **Where dark painted shadows should remain on this source car**:
+
 ## Prompt Decisions
 
 - **Composition mode**: keep source / match reference scale only / match selected reference camera feel
@@ -88,6 +100,7 @@ Mark failed items before deciding whether to accept or retry.
 ### Level 2: Style Gates
 
 - **Paint hue / saturation / brightness**: pass / fail
+- **Paint luminance range consistency**: pass / fail
 - **Paint material and gloss**: pass / fail
 - **Highlight placement and softness**: pass / fail
 - **Side-profile contrast and local highlight brightness**: pass / fail

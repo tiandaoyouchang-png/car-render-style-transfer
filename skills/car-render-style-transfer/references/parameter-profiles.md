@@ -111,6 +111,7 @@ Required paint wording:
 
 ```text
 Use unified cool pearl silver-gray paint, HSB around H=216 and S=10, with medium-light midtones about half a stop darker than bright white. Keep satin-gloss clearcoat, soft silver-blue highlights, neutral cool gray/black studio reflection bands, and cool blue-gray lower-body shadows. Do not shift purple/violet, warm white, bright white, or green-tinted.
+For style-reference consistency, use the measured paint luminance ranges from `references/paint-calibration.md`; do not reuse fixed brightness ranges from a different reference image.
 ```
 
 ## reference-studio

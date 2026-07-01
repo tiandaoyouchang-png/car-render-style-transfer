@@ -26,14 +26,15 @@ Do not place multiple source vehicles in one generation context. For batch work,
 1. **Reset context for the job.** Start from the original `SOURCE_IMAGE`, the source-derived `CONTROL_LINE_IMAGE`, and the `STYLE_REFERENCE_IMAGE`. Never use a previous generated candidate as the next input.
 2. **Create the job record.** Use `references/job-record-template.md` before generation. Record asset paths/IDs, selected profile, prompt versions, and initial decisions. The job record is a production log, not prompt text.
 3. **Fill the compact worksheet.** Use `references/analysis-worksheet.md` to extract only the source-lock facts, style recipe, prompt decisions, and audit targets needed for this car.
-4. **Choose one parameter profile.** Use `references/parameter-profiles.md`. Do not improvise parameter language unless a failure requires it.
-5. **Create or verify control line.** Use `references/control-line-prompt.md`. Generate the line control from `SOURCE_IMAGE`, not from `STYLE_REFERENCE_IMAGE`. The control-line prompt must name the source file/asset and describe its visible identity so the model cannot confuse it with the style reference. Reject the control line if wheel centers, silhouette, fascia, lamp shapes, window layout, crop, perspective, or source vehicle scale drift.
-6. **Update the job record.** Record the accepted control line, control-line prompt version, selected profile, and any rejected control-line attempt.
-7. **Build the final render prompt.** Use `references/prompt-template.md`. Fill only the slots that apply. Delete unused placeholders.
-8. **Generate candidates.** Use 4 candidates for a single careful render and 2 candidates per car for batch runs unless the user specifies otherwise.
-9. **Run quality gates.** Reject candidates that fail any Level-1 structure gate or any requested background/paint gate.
-10. **Update the job record after review.** Record candidate IDs, accepted result, rejected candidates, failed gates, failure notes, changed parameter group, and next action.
-11. **Recover by changing parameters only.** Use `references/failure-recovery.md`. Restart from original inputs every retry.
+4. **Calibrate paint luminance from the style reference.** Use `references/paint-calibration.md` when the job needs consistent silver paint, batch consistency, or when outputs look too flat/bright/dark. Record highlight, midtone, and shadow brightness ranges.
+5. **Choose one parameter profile.** Use `references/parameter-profiles.md`. Do not improvise parameter language unless a failure requires it.
+6. **Create or verify control line.** Use `references/control-line-prompt.md`. Generate the line control from `SOURCE_IMAGE`, not from `STYLE_REFERENCE_IMAGE`. The control-line prompt must name the source file/asset and describe its visible identity so the model cannot confuse it with the style reference. Reject the control line if wheel centers, silhouette, fascia, lamp shapes, window layout, crop, perspective, or source vehicle scale drift.
+7. **Update the job record.** Record the accepted control line, control-line prompt version, selected profile, and any rejected control-line attempt.
+8. **Build the final render prompt.** Use `references/prompt-template.md`. Fill only the slots that apply. Delete unused placeholders.
+9. **Generate candidates.** Use 4 candidates for a single careful render and 2 candidates per car for batch runs unless the user specifies otherwise.
+10. **Run quality gates.** Reject candidates that fail any Level-1 structure gate or any requested background/paint gate.
+11. **Update the job record after review.** Record candidate IDs, accepted result, rejected candidates, failed gates, failure notes, changed parameter group, and next action.
+12. **Recover by changing parameters only.** Use `references/failure-recovery.md`. Restart from original inputs every retry.
 
 ## Decision Tree
 
@@ -56,6 +57,7 @@ Do not place multiple source vehicles in one generation context. For batch work,
 ## Non-Negotiable Rules
 
 - Use `STYLE_REFERENCE_IMAGE` for lighting, material, color expression, reflection quality, and render polish only.
+- When consistent paint is required, match the reference's measured paint luminance ranges, not just the descriptive color name.
 - Use `SOURCE_IMAGE` for all vehicle design details that line art cannot express.
 - When source glass is noisy, checkerboard-backed, dirty, or low quality, use `SOURCE_IMAGE` only for glass shape, boundary, pillars, and trim. Do not inherit source glass interior pixel texture; regenerate glass material from the style recipe.
 - Use `CONTROL_LINE_IMAGE` for geometry, stance, perspective, wheel positions, panel layout, and crop.
@@ -96,6 +98,7 @@ Treat the output as failed when any Level-1 item fails.
 **Level 2: requested style gates**
 
 - Paint hue, saturation, brightness, metallic/pearl behavior, gloss, highlight bands, and shadow color match the chosen profile.
+- Paint brightness distribution follows the calibrated reference ranges for dark shadows, midtones, main highlights, and brightest accent highlights.
 - Lighting recipe matches the reference: upper softbox, glass darkness, mid-body highlight, lower-body shading, rim light, and contrast.
 - No source glass pixel noise, checkerboard remnants, dirty smears, cloudy patches, or busy source reflections are inherited into windshield or side glass interiors.
 - Rendering remains sharp enough for lamps, grille, wheels, panel gaps, and edges.
@@ -122,6 +125,7 @@ Use these defaults unless a selected profile overrides them.
 ## Resource Loading
 
 - Load `references/analysis-worksheet.md` when analyzing a new source/style pair or auditing output.
+- Load `references/paint-calibration.md` when a reference image should define consistent paint brightness, highlight, and shadow ranges.
 - Load `references/parameter-profiles.md` before choosing generation settings.
 - Load `references/control-line-prompt.md` when generating or regenerating the source-derived control line.
 - Load `references/prompt-template.md` only when writing the line-control or final render prompt.

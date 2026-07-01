@@ -51,6 +51,16 @@ generation_record:
   profile:
   control_line_prompt_version: control-line-cad-v1
   render_prompt_version: render-template-v2.1
+  paint_calibration_reference:
+  paint_luminance_targets:
+    dark_painted_shadows_hsb_b:
+    controlled_midtones_hsb_b:
+    main_highlights_hsb_b:
+    brightest_accent_highlights_hsb_b:
+    dark_painted_shadows_l_star:
+    controlled_midtones_l_star:
+    main_highlights_l_star:
+    brightest_accent_highlights_l_star:
   candidate_count:
   background_mode:
   paint_target:
@@ -88,6 +98,7 @@ quality_gate_results:
     vehicle_scale_position:
   level_2_style:
     paint_hue_saturation_brightness:
+    paint_luminance_range_consistency:
     paint_material_gloss:
     highlight_placement_softness:
     side_profile_contrast_local_highlights:
