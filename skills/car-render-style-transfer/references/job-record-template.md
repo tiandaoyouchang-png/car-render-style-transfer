@@ -94,6 +94,7 @@ quality_gate_results:
     glass_lower_body_rim_light:
     glass_continuity_no_stripes_blocks_noise:
     a_pillar_windshield_edge_cleanliness:
+    glass_material_override_no_source_texture:
     render_sharpness_cgi_polish:
   level_3_background_artifacts:
     requested_background:

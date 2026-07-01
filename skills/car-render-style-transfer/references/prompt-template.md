@@ -10,8 +10,9 @@ Template version: `render-template-v2.1`.
 2. Put source-lock facts before style facts.
 3. Describe the reference as a lighting/material recipe, not as a vehicle to copy.
 4. Use the selected parameter profile wording exactly unless a failure-recovery step requires a targeted change.
-5. Do not paste the full worksheet into the prompt. Convert it into short, concrete facts.
-6. Do not include unused placeholders or contradictory composition instructions.
+5. When source glass is dirty/noisy/checkerboard-backed, state that source controls glass shape and boundary only, while style controls glass material.
+6. Do not paste the full worksheet into the prompt. Convert it into short, concrete facts.
+7. Do not include unused placeholders or contradictory composition instructions.
 
 ## Control-Line Prompt
 
@@ -166,6 +167,14 @@ Use when the A-pillar, mirror base, or windshield edge looks dirty, cloudy, or o
 
 ```text
 Clean A-pillar-to-windshield boundary: crisp painted A-pillar and black rubber glass seal, smooth continuous dark windshield, clean front side-window corner, and clean mirror-base shadow. Do not show dirty gray smears, dusty speckles, muddy blotches, cloudy patches, checkerboard remnants, or busy reflected texture around the A-pillar, windshield edge, mirror base, or front side-window corner.
+```
+
+### Glass Material Override
+
+Use when the source glass itself contains noise, checkerboard remnants, dirty reflections, or low-quality transparency artifacts.
+
+```text
+Use SOURCE_IMAGE only for glass outline, glass edge geometry, A/B/C pillar positions, black trim, and mirror-base placement. Do not inherit or preserve SOURCE_IMAGE glass interior pixels, texture, noise, dirt, cloudy reflections, checkerboard remnants, speckles, or low-quality transparency artifacts. Regenerate all glass interiors from the STYLE_REFERENCE_IMAGE material recipe as smooth continuous dark smoked automotive glass with subtle clean studio reflections.
 ```
 
 ### Side-Profile High-Contrast Silver

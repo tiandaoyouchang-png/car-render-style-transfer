@@ -57,6 +57,7 @@ Do not place multiple source vehicles in one generation context. For batch work,
 
 - Use `STYLE_REFERENCE_IMAGE` for lighting, material, color expression, reflection quality, and render polish only.
 - Use `SOURCE_IMAGE` for all vehicle design details that line art cannot express.
+- When source glass is noisy, checkerboard-backed, dirty, or low quality, use `SOURCE_IMAGE` only for glass shape, boundary, pillars, and trim. Do not inherit source glass interior pixel texture; regenerate glass material from the style recipe.
 - Use `CONTROL_LINE_IMAGE` for geometry, stance, perspective, wheel positions, panel layout, and crop.
 - Generate structural controls from the source car that must keep its shape.
 - If structure and style conflict, preserve structure and reduce style strength.
@@ -96,6 +97,7 @@ Treat the output as failed when any Level-1 item fails.
 
 - Paint hue, saturation, brightness, metallic/pearl behavior, gloss, highlight bands, and shadow color match the chosen profile.
 - Lighting recipe matches the reference: upper softbox, glass darkness, mid-body highlight, lower-body shading, rim light, and contrast.
+- No source glass pixel noise, checkerboard remnants, dirty smears, cloudy patches, or busy source reflections are inherited into windshield or side glass interiors.
 - Rendering remains sharp enough for lamps, grille, wheels, panel gaps, and edges.
 
 **Level 3: background and artifact gates**

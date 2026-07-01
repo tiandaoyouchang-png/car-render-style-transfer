@@ -94,6 +94,7 @@ Mark failed items before deciding whether to accept or retry.
 - **Glass darkness / lower-body shading / rim light**: pass / fail
 - **Glass continuity, no stripes/blocks/noise**: pass / fail
 - **A-pillar and windshield-edge cleanliness**: pass / fail
+- **Glass material override, no source glass texture inherited**: pass / fail
 - **Render sharpness and CGI polish**: pass / fail
 
 ### Level 3: Background / Artifact Gates

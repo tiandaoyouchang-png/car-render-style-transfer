@@ -32,6 +32,7 @@ Do not change structure language, paint target, lighting, background, and compos
 | Output becomes blurry | iterative editing or overconstrained correction | restart from original inputs; do not use generated candidate; keep prompt shorter and profile-based |
 | Windshield or glass has black-white stripes, checkerboard blocks, or noisy patches | transparency checkerboard/source noise/control-line texture leaked into glass rendering | restore smooth continuous dark smoked automotive glass; forbid checkerboard, zebra stripes, patchy blocks, pixel noise, white bars, and texture transfer inside glass |
 | A-pillar or windshield edge looks dirty, muddy, smudged, or contaminated | noisy source artifacts or reflection texture collected at the glass/body boundary | clean the A-pillar-to-windshield seam; use crisp black rubber trim and smooth dark glass; forbid dirty gray smears, dust, speckles, blotches, cloudy patches, and muddy edge reflections |
+| Glass still looks dirty after cleanup | source glass interior pixels are being preserved as detail | use glass-material override; source controls glass outline/pillars/trim only, not glass interior texture; regenerate glass material from style reference |
 | Batch outputs inconsistent | context contamination or profile drift | isolate one car per call; reuse same profile; store source-lock facts per car; avoid carrying previous failures into next car |
 
 ## Targeted Correction Blocks
@@ -86,6 +87,12 @@ Correction for this retry: windshield/glass artifacts were detected. Keep the sa
 
 ```text
 Correction for this retry: the A-pillar and windshield edge looked dirty or contaminated. Keep the same source geometry, crop, paint, and lighting style, but clean only the A-pillar-to-windshield boundary. Render the A-pillar as clean painted body/black trim, the windshield edge as crisp black rubber sealing, and the windshield as smooth continuous dark smoked glass. Do not place dirty gray smears, dust, speckles, muddy blotches, cloudy patches, source noise, checkerboard remnants, or busy reflected texture around the A-pillar, windshield edge, mirror base, or front side-window corner.
+```
+
+### Glass Material Override
+
+```text
+Correction for this retry: source glass texture is contaminating the result. Treat SOURCE_IMAGE glass as a shape and boundary reference only. Preserve the exact windshield outline, side-window outline, A/B/C pillar positions, black trim, mirror base, and glass edge geometry, but do not preserve the source glass interior pixels, texture, transparency artifacts, noise, dirt, cloudy reflections, checkerboard remnants, or speckles. Regenerate all glass interiors from the STYLE_REFERENCE_IMAGE material recipe as clean continuous dark smoked automotive glass with subtle smooth studio reflections.
 ```
 
 ## Acceptance Rule
