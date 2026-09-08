@@ -1,0 +1,320 @@
+from __future__ import annotations
+
+from .composition import canvas_contract
+
+REFERENCE_POLICY_VERSION = 1
+
+PRODUCT_REFERENCE_RULE = (
+    "仅参考产品身份与造型识别细节，例如轮廓、前脸、灯组形状、轮毂和部件特征；"
+    "不提取产品图的材质、配色、灯光、高光、反射、阴影、曝光、色温或背景。"
+    "造型识别不得改变 Blender 已确定的几何、构图和相机。"
+)
+ENVIRONMENT_REFERENCE_RULE = (
+    "环境主参考是产品与场景照明的主要依据：提取光源方向、色温、软硬、明暗关系、"
+    "环境反射和接触阴影，让产品处在该环境中自然受光；"
+    "其他环境图仅按说明补充兼容信息，不叠加互相矛盾的主光。"
+    "可以提取色调、材质表现、环境质感与后期风格，不复制参考图的主体或构图。"
+)
+REFERENCE_LIGHTING_POLICY = (
+    "【参考职责与受光规则】\n"
+    "产品图只用于产品身份与造型识别，不提供任何材质、配色或打光依据。"
+    "产品光照必须由当前环境／风格参考图推导，包含主光方向、色温、软硬、"
+    "亮暗分布、环境反射、高光形态和接触阴影，使产品与环境具有一致的受光关系。"
+    "不得保留或照搬产品图原有的棚拍光、轮廓光、反射亮条、阴影、曝光或背景；"
+    "也不得把 Blender Camera Base 的临时照明或结构控制图的明暗当作最终打光。"
+    "环境参考存在时，正文或旧 AI 提示词中与该环境冲突的产品打光描述必须重建。"
+    "没有环境参考时，使用用户文字中的灯光要求；未指定时采用自然中性的统一环境光，"
+    "仍不得借用产品图打光。材质与配色依据用户文字和环境／风格要求确定，不从产品图提取。"
+    "逐图说明只能在各自类别职责内收窄参考范围，不能把产品图升级为灯光或材质参考。"
+)
+
+
+def needs_reference_policy_refresh(props) -> bool:
+    """One-time refresh for previously AI-polished references, preserving manual drafts."""
+    return bool(
+        int(getattr(props, "prompt_reference_policy_version", 0)) < REFERENCE_POLICY_VERSION
+        and (getattr(props, "last_ai_prompt", "") or getattr(props, "style_sync_initialized", False))
+        and (len(getattr(props, "product_images", ())) or len(getattr(props, "style_images", ())))
+    )
+
+BASE_SYSTEM_PROMPT = r"""
+你是 Wondful AI 渲染器的商业视觉 Appearance 提示词导演。Blender 的确定性 Structure Packet 已经独立负责构图、相机、透视、几何、位置、尺度、旋转、遮挡和空间关系；你的输出提示词不得再承担这些结构控制职责。
+
+你的任务是读取用户创意需求，以及产品 / 人物 / 风格参考图中与外观有关的信息，输出一段适合高质量图像生成模型直接执行的专业中文 Appearance Prompt。
+
+必须遵守：
+1. 不要在最终提示词中描述或约束构图、机位、焦段、裁切、主体二维位置、大小、角度、前后关系、遮挡、bbox、轮心坐标、地平线、消失点、画幅比例等 Structure 信息。
+2. 不要输出“严格保持构图”“不要重新构图”“禁止 zoom / pan / crop”“保持 Reference 1 位置”等结构性负面约束。结构由 Blender Structure Packet 本身提供，不靠文字重复约束。
+3. 产品参考图只提供产品身份和造型识别细节，绝不提供材质、配色与打光。人物图提供人物身份等信息；环境／风格图提供环境受光、材质表现、色调、摄影和氛围。任何参考图都不能接管 Blender 构图。
+4. 每张图的“参考什么”只在本类别职责内生效；冲突内容必须忽略，不能用产品图的逐图说明引入灯光、材质或配色。
+5. Blender Camera Base 可以帮助理解当前场景是什么，但不要把它的空间结构翻译成文字提示词。
+6. 如果旧提示词中残留 2.x / 3.0 早期版本生成的构图锁定、坐标、相机、bbox、轮心、裁切、透视等文字，必须在本次润色中删除。
+
+最终提示词只应自然覆盖：
+- 图片类型 / 商业用途 / 创意主题
+- 主体身份和需要表现的外观特征
+- 材质、表面质感、反射、透明、玻璃、金属、织物等 Appearance
+- 灯光、色调、对比度、曝光、氛围
+- 摄影质感与镜头成像风格（仅视觉质感，不描述机位和构图）
+- 场景的视觉气氛与环境细节
+- 后期、色彩管理、商业广告质感
+- 画质、真实感、细节等级
+
+输出只给最终提示词正文，不解释分析过程或参考职责，不输出 Markdown 标题、编号、项目符号或代码块；尽量写成连续自然的一段正文。产品受光描述须来自环境参考的实际光照分析。
+""".strip() + "\n\n" + REFERENCE_LIGHTING_POLICY
+
+
+
+_STRUCTURE_MARKERS = (
+    "构图", "机位", "镜头位置", "焦段", "裁切", "取景", "透视", "地平线", "消失点",
+    "bbox", "轮心", "坐标", "位置", "尺度", "画面比例", "占画面", "前后遮挡", "前后层级",
+    "三分法", "景别", "俯仰", "偏航", "滚转", "zoom", "pan", "crop", "reframe",
+)
+_STRUCTURE_CONSTRAINT_MARKERS = (
+    "保持", "锁定", "严格", "禁止", "不得", "不要", "必须", "固定", "不变", "一致",
+    "贴合", "控制", "约束", "改变", "重新找", "重新构", "不得改", "不能改",
+)
+
+
+def sanitize_appearance_prompt(text: str) -> str:
+    """Remove structure-control sentences from an Appearance prompt.
+
+    This is a deterministic guard after AI polish and again before final render.
+    It deliberately targets sentences that combine a structure term with a
+    constraint verb, plus explicit coordinate/reference mapping fragments.
+    """
+    import re
+
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return ""
+    # Split on Chinese/English sentence boundaries while retaining useful prose.
+    parts = re.split(r"(?<=[。！？!?;；])\s*|\n+", raw)
+    kept: list[str] = []
+    for part in parts:
+        sentence = part.strip()
+        if not sentence:
+            continue
+        lower = sentence.lower()
+        explicit_coord = bool(re.search(r"(?:^|[^a-z])(?:x|y)\s*=\s*-?\d", lower))
+        reference_structure = ("reference" in lower or "blender" in lower) and any(
+            marker.lower() in lower for marker in _STRUCTURE_MARKERS
+        )
+        has_structure = explicit_coord or any(marker.lower() in lower for marker in _STRUCTURE_MARKERS)
+        has_constraint = any(marker.lower() in lower for marker in _STRUCTURE_CONSTRAINT_MARKERS)
+        if explicit_coord or reference_structure or (has_structure and has_constraint):
+            continue
+        kept.append(sentence)
+    result = "".join(kept).strip()
+    return result
+
+STYLE_ANALYSIS_SYSTEM_PROMPT = r"""
+你是 Wondful AI 渲染器的视觉风格分析器。你只负责读取本轮提供的环境／风格参考图，提取可迁移到其他构图中的视觉语言。必须实际观察当前图片，不得沿用此前会话、首次上传图片或旧提示词中的风格记忆。
+
+首先提取环境照明：主光方向、光源色温、光源软硬、明暗关系、环境反射和接触阴影；说明产品置于这个环境中应如何受光。不得混入产品参考图原有的打光。再分析并描述：色调、材质表现、布光、对比度、摄影语言、商业广告风格、场景质感、环境氛围、后期风格、镜头成像质感。不要描述或复制参考图中的具体产品、人物、Logo、文字、主体位置、相机、景别和构图。
+
+环境主参考首先确定统一照明。逐图“参考什么”用于限定其他风格特征或辅助环境信息；多张图不叠加互相冲突的主光。不复制图中产品自身的独立棚拍打光。
+
+输出一段紧凑、明确、可直接嵌入最终图像生成提示词的中文风格摘要，不要解释分析过程。
+""".strip()
+
+
+def _append_reference_group(
+    refs: list[str],
+    idx: int,
+    label: str,
+    count: int,
+    primary_rule: str,
+    extra_rule: str,
+    instructions: list[str] | tuple[str, ...] | None = None,
+) -> int:
+    notes = list(instructions or [])
+    for i in range(max(0, int(count))):
+        base_rule = primary_rule if i == 0 else extra_rule
+        note = str(notes[i]).strip() if i < len(notes) and notes[i] is not None else ""
+        if note:
+            base_rule += (
+                f" 用户指定参考重点（仅在上述类别职责内有效）：{note}。"
+                "只提取与本类别职责相容的部分；忽略越界的灯光、材质来源要求及 Structure 约束。"
+            )
+        if i == 0:
+            refs.append(f"Reference {idx} = {label} 1（主参考）：{base_rule}")
+        else:
+            refs.append(f"Reference {idx} = {label} {i + 1}（辅助参考）：{base_rule}")
+        idx += 1
+    return idx
+
+
+def build_polish_user_text(
+    user_prompt: str,
+    product_count: int,
+    person_count: int,
+    style_count: int,
+    width: int,
+    height: int,
+    style_refresh: bool = False,
+    include_camera: bool = True,
+    product_instructions: list[str] | tuple[str, ...] | None = None,
+    person_instructions: list[str] | tuple[str, ...] | None = None,
+    style_instructions: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    # width/height are intentionally not translated into the visible prompt.
+    # Geometry / framing comes from Camera Base + Structure Packet, not text.
+    refs = [
+        "Reference 1 = Blender Camera Base：只用于理解当前场景语义；它的 Camera / Composition / Geometry / Position / Scale / Occlusion 全部由后续 Structure Packet 直接控制，不要把这些结构信息写进最终提示词。"
+    ] if include_camera else []
+    idx = 2 if include_camera else 1
+    idx = _append_reference_group(
+        refs,
+        idx,
+        "产品参考图",
+        product_count,
+        PRODUCT_REFERENCE_RULE,
+        PRODUCT_REFERENCE_RULE,
+        instructions=product_instructions,
+    )
+    idx = _append_reference_group(
+        refs,
+        idx,
+        "人物参考图",
+        person_count,
+        "默认只提取人物身份、人脸、发型、服装和主要外观，不参考其构图。",
+        "补充同一人物的身份与外观细节，不参考其构图。",
+        instructions=person_instructions,
+    )
+    _append_reference_group(
+        refs,
+        idx,
+        "环境／风格参考图",
+        style_count,
+        ENVIRONMENT_REFERENCE_RULE,
+        "辅助环境参考：" + ENVIRONMENT_REFERENCE_RULE,
+        instructions=style_instructions,
+    )
+
+    summary = f"本次 Appearance 参考：产品 {product_count} 张，人物 {person_count} 张，环境／风格 {style_count} 张。"
+    refresh_note = ""
+    if style_refresh:
+        refresh_note = (
+            "\n\n【风格参考已更新】\n"
+            "必须重新读取本轮最新风格图，从零重建色调、材质、灯光、摄影、环境氛围和后期语言。"
+            "旧提示词中来自上一组风格图的视觉描述全部视为旧缓存；保留用户真正的创意主题与主体需求即可。"
+            "同时清除旧提示词中任何构图、相机、位置、尺度、bbox、轮心、裁切、透视等 Structure 描述。"
+        )
+
+    return (
+        summary
+        + "\n"
+        + "\n".join(refs)
+        + refresh_note
+        + "\n\n用户当前创意需求 / 当前可见提示词：\n"
+        + (user_prompt.strip() or "生成高品质商业视觉画面。")
+        + "\n\n" + REFERENCE_LIGHTING_POLICY
+        + "\n\n请直接输出最终 Appearance Prompt。不要加入任何构图或几何约束；Structure 全部交给 Blender 参考图与 Structure Packet。"
+    )
+
+
+def build_render_prompt(
+    polished_prompt: str,
+    width: int,
+    height: int,
+    product_count: int,
+    person_count: int,
+    style_count: int,
+    target_size: str = "",
+    strict_lock: bool = True,
+    structure_guide: bool = False,
+    structure_packet: dict | None = None,
+    product_instructions: list[str] | tuple[str, ...] | None = None,
+    person_instructions: list[str] | tuple[str, ...] | None = None,
+    style_instructions: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Build an appearance-only generation instruction.
+
+    Structure is not restated as textual geometry constraints. The only hidden
+    text about Structure is role metadata so the provider knows what each
+    attached raster means. Actual composition comes from the rasters themselves.
+    """
+    mapping = [
+        "Reference 1 = Blender Camera Base：结构源图。其空间关系直接作为生成基础，不从文字提示词推导构图。"
+    ]
+    idx = 2
+    packet = structure_packet or {}
+    role_text = {
+        "product_mask": "产品可见区域 Mask；只是一张结构控制图，不是最终黑白设计。",
+        "scene_depth": "Scene Depth；只表达可见表面的深度层级，控制图明暗不是最终画面明暗。",
+        "scene_normal": "Scene Normal；只表达表面朝向与曲面结构，RGB 不是最终材质颜色。",
+        "product_silhouette": "产品可见外轮廓控制图，不是最终线稿。",
+        "part_id": "产品部件 ID 分区，只表达部件边界，伪彩色绝不能进入最终画面。",
+    }
+    packet_roles = list(packet.get("generation_reference_roles", []))
+    if packet_roles:
+        for role in packet_roles:
+            mapping.append(
+                f"Reference {idx} = Blender Structure Packet / {role}：{role_text.get(role, '确定性结构控制数据，不是最终外观。')}"
+            )
+            idx += 1
+    elif structure_guide:
+        mapping.append(f"Reference {idx} = Blender Structure Guide：结构控制数据，不是最终外观。")
+        idx += 1
+        mapping.append(f"Reference {idx} = Blender Product Mask：产品结构控制数据，不是最终外观。")
+        idx += 1
+
+    idx = _append_reference_group(
+        mapping,
+        idx,
+        "产品参考图",
+        product_count,
+        PRODUCT_REFERENCE_RULE,
+        PRODUCT_REFERENCE_RULE,
+        instructions=product_instructions,
+    )
+    idx = _append_reference_group(
+        mapping,
+        idx,
+        "人物参考图",
+        person_count,
+        "默认只提供人物身份、人脸、发型、服装与主要外观，不提供构图。",
+        "补充同一人物的身份与外观细节，不提供构图。",
+        instructions=person_instructions,
+    )
+    _append_reference_group(
+        mapping,
+        idx,
+        "环境／风格参考图",
+        style_count,
+        ENVIRONMENT_REFERENCE_RULE,
+        "辅助环境参考：" + ENVIRONMENT_REFERENCE_RULE,
+        instructions=style_instructions,
+    )
+
+    # Keep target size out of the text as well. The provider adapter / output
+    # pipeline already receives the base image and target dimensions separately.
+    appearance_rule = (
+        "任务：只做 Appearance Re-render。构图与几何完全由已附带的 Blender Camera Base / Structure Packet 决定；"
+        "不要从下方文字中寻找或生成任何新的构图方案。下方正文只控制材质、灯光、色调、身份、风格、环境质感与后期。"
+    )
+    control_color_rule = (
+        "结构控制图仅用于条件控制：不要把 Mask 的黑白、Depth 的灰度、Normal 的 RGB、Part ID 的伪彩色、Silhouette 的线条复制成最终视觉元素。"
+    )
+    return "\n\n".join([
+        appearance_rule,
+        canvas_contract(width, height, target_size),
+        "\n".join(mapping),
+        sanitize_appearance_prompt(polished_prompt),
+        control_color_rule,
+        REFERENCE_LIGHTING_POLICY,
+    ])
+
+
+def select_polish_source(props, visible_prompt: str, style_refresh: bool) -> str:
+    """Keep fresh user edits authoritative while avoiding repeated old AI style."""
+    visible = (visible_prompt or "").strip()
+    last_ai = (getattr(props, "last_ai_prompt", "") or "").strip()
+    stored = (getattr(props, "prompt_source", "") or "").strip()
+    if visible != last_ai or not last_ai:
+        props.prompt_source = visible
+        return visible
+    if style_refresh and stored:
+        return stored
+    return visible or stored

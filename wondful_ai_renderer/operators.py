@@ -1,0 +1,2054 @@
+# RNA Property declarations must evaluate at class creation (Blender 4.3+).
+
+import hashlib
+import shutil
+import threading
+import uuid
+import time
+import traceback
+from pathlib import Path
+
+import bpy
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, IntProperty, StringProperty
+from bpy.types import Operator
+from bpy_extras.io_utils import ImportHelper
+
+from .codex_client import (
+    CodexImageGenerationUnavailable,
+    CodexNotInstalledError,
+    CodexNotLoggedInError,
+    discover_codex_cli,
+    generate_image as codex_generate_image,
+    audit_alignment as codex_audit_alignment,
+    get_account_status,
+    login_chatgpt,
+    logout as codex_logout,
+    polish_prompt as codex_polish_prompt,
+)
+from .antigravity_client import (
+    AntigravityError,
+    AntigravityImageGenerationUnavailable,
+    AntigravityNotInstalledError,
+    AntigravityNotLoggedInError,
+    audit_alignment as antigravity_audit_alignment,
+    discover_antigravity_cli,
+    generate_image as antigravity_generate_image,
+    get_account_status as get_antigravity_account_status,
+    open_google_login as open_antigravity_google_login,
+    polish_prompt as antigravity_polish_prompt,
+)
+from .clipboard_utils import ClipboardImageError, save_clipboard_image
+from .config_manager import CONFIG_DIR, average_timing, record_timing
+from .composition import image_dimensions, assess_canvas, assess_audit, repair_region, write_repair_mask
+from .image_manager import compute_target_size, enforce_aspect_ratio, image_filepath, load_image, prepare_reference_for_upload
+from .prompt_engine import BASE_SYSTEM_PROMPT, STYLE_ANALYSIS_SYSTEM_PROMPT, build_polish_user_text, build_render_prompt, sanitize_appearance_prompt, needs_reference_policy_refresh, REFERENCE_POLICY_VERSION, select_polish_source
+from .render_session import cleanup_old_sessions, copy_references, create_session, save_metadata
+from .output_manager import export_result, resolve_output_directory, preflight_output_directory
+from .viewport_capture import capture_camera_reference, camera_output_dimensions
+from .structure_packet import build_structure_packet
+from .properties import MAX_REFERENCES_PER_KIND
+from . import prompt_profiles
+from .reference_bundle import MAX_ANTIGRAVITY_IMAGE_PATHS, MAX_IMAGE_PATHS, prepare_bundle
+from .model_catalog import discover_models
+from .antigravity_auth import AuthSession
+from .cli_transport import safe_diagnostic
+import tempfile
+import json
+import webbrowser
+from queue import Empty, Queue
+from .prompt_editor import open_prompt_in_area, close_prompt_area, sync_prompt_editors
+
+
+RENDER_VARIANT_COUNT = 4
+ANTIGRAVITY_RENDER_VARIANT_COUNT = 2
+
+
+def render_variant_count(provider_id: str) -> int:
+    """Return the requested output count for the selected image provider."""
+    return (
+        ANTIGRAVITY_RENDER_VARIANT_COUNT
+        if str(provider_id or "").strip().lower() == "antigravity"
+        else RENDER_VARIANT_COUNT
+    )
+
+
+_ACTIVE_LOCK = threading.Lock()
+_AGY_AUTH = None
+_AGY_AUTH_OWNER = None
+_ASYNC_STATUSES = frozenset({"AUTHENTICATING", "REFRESHING_MODELS", "POLISHING", "RENDERING"})
+
+
+def cancel_auth_session(*, detach=False, context=None):
+    if _AGY_AUTH is not None:
+        _AGY_AUTH.cancel()
+    if detach and _AGY_AUTH_OWNER is not None and context is not None:
+        _AGY_AUTH_OWNER._cleanup(context)
+
+
+
+def _addon_prefs(context):
+    return context.preferences.addons[__package__].preferences
+
+
+def _status(props, status, error=""):
+    props.status = status
+    props.last_error = error
+    if status not in {"POLISHING", "RENDERING"}:
+        props.task_phase = ""
+
+
+def reset_stale_task_status(props) -> bool:
+    """Return a persisted in-progress state to idle after a file reload.
+
+    Async workers and modal handlers cannot survive opening a .blend file.  The
+    status property can, however, be serialized while a task is in progress;
+    only clear it when the process-wide task lock is free so a genuinely active
+    worker is never made available to a second operation.
+    """
+    try:
+        stale = props.status in _ASYNC_STATUSES
+        if not stale or _ACTIVE_LOCK.locked():
+            return False
+        _status(props, "IDLE")
+        props.progress = 0.0
+        props.eta_seconds = 0
+        return True
+    except (AttributeError, ReferenceError, TypeError):
+        return False
+
+
+def _apply_account_status(props, status) -> None:
+    props.codex_cli_resolved = status.cli_path or ""
+    props.codex_cli_version = status.version or ""
+    props.codex_account_message = status.message or ""
+    if not status.installed:
+        props.codex_account_state = "NOT_INSTALLED"
+    elif status.logged_in:
+        props.codex_account_state = "LOGGED_IN"
+    else:
+        props.codex_account_state = "LOGGED_OUT"
+
+
+def _apply_antigravity_account_status(props, status) -> None:
+    props.antigravity_cli_resolved = status.cli_path or ""
+    props.antigravity_cli_version = status.version or ""
+    props.antigravity_account_message = status.message or ""
+    if not status.installed:
+        props.antigravity_account_state = "NOT_INSTALLED"
+    elif status.logged_in:
+        props.antigravity_account_state = "LOGGED_IN"
+    else:
+        props.antigravity_account_state = status.state
+
+
+def _analysis_provider(props, prefs):
+    # The persisted property name remains `analysis_provider` for backward compatibility,
+    # but since 2.11 it is the single provider for polish + audit + final image generation.
+    if props.analysis_provider == "ANTIGRAVITY":
+        return {
+            "id": "antigravity",
+            "label": "Antigravity",
+            "discover": lambda: discover_antigravity_cli(prefs.antigravity_cli_path or getattr(props, "antigravity_cli_resolved", "")),
+            "cli_path": str(prefs.antigravity_cli_path or getattr(props, "antigravity_cli_resolved", "") or ""),
+            "model": str(prefs.antigravity_model or ""),
+            "polish": antigravity_polish_prompt,
+            "audit": antigravity_audit_alignment,
+            "generate": antigravity_generate_image,
+            "imagegen_enabled": bool(prefs.antigravity_imagegen_enabled),
+            "polish_timeout": int(prefs.antigravity_polish_timeout),
+            "audit_timeout": int(prefs.antigravity_audit_timeout),
+            "render_timeout": int(prefs.antigravity_render_timeout),
+            "reference_limit": MAX_ANTIGRAVITY_IMAGE_PATHS,
+        }
+    return {
+        "id": "codex",
+        "label": "Codex",
+        "discover": lambda: discover_codex_cli(prefs.codex_cli_path or getattr(props, "codex_cli_resolved", "")),
+        "cli_path": str(prefs.codex_cli_path or getattr(props, "codex_cli_resolved", "") or ""),
+        "model": str(prefs.codex_model or ""),
+        "polish": codex_polish_prompt,
+        "audit": codex_audit_alignment,
+        "generate": codex_generate_image,
+        "imagegen_enabled": bool(prefs.codex_imagegen_enabled),
+        "polish_timeout": int(prefs.codex_polish_timeout),
+        "audit_timeout": int(prefs.codex_audit_timeout),
+        "render_timeout": int(prefs.codex_render_timeout),
+        "reference_limit": MAX_IMAGE_PATHS,
+    }
+
+
+def _get_prompt_text(props):
+    sync_prompt_editors(props)  # flush typing even before the next 250ms timer tick
+    # 3.0.1: props.prompt is the only source of truth. Older Blender fallback
+    # rows synchronize into this value without inserting soft-wrap newlines.
+    return (props.prompt or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _set_prompt_text(props, text):
+    # RNA callback also refreshes an open full-text editor.
+    props.prompt = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _reference_paths(props):
+    def paths(collection):
+        result = []
+        for item in collection:
+            path = item.source_path.strip() if getattr(item, "source_path", "") else ""
+            if not path:
+                path = image_filepath(item.image) or ""
+            if path:
+                result.append(path)
+        return result
+
+    return {
+        "product": paths(props.product_images),
+        "person": paths(props.person_images),
+        "style": paths(props.style_images),
+    }
+
+
+def _reference_instructions(props):
+    """Return per-image user instructions aligned with _reference_paths ordering."""
+    def notes(collection):
+        result = []
+        for item in collection:
+            path = item.source_path.strip() if getattr(item, "source_path", "") else ""
+            if not path:
+                path = image_filepath(item.image) or ""
+            if path:
+                result.append((getattr(item, "instruction", "") or "").strip())
+        return result
+
+    return {
+        "product": notes(props.product_images),
+        "person": notes(props.person_images),
+        "style": notes(props.style_images),
+    }
+
+
+def _instruction_lines(label, notes):
+    rows = []
+    for i, note in enumerate(notes or [], start=1):
+        text = str(note or "").strip()
+        if text:
+            rows.append(f"{label} {i} 用户指定参考重点：{text}")
+    return "\n".join(rows)
+
+
+def _reference_fingerprint(paths):
+    """Fingerprint the actual reference bytes, not only Blender datablock identity.
+
+    This catches same-path file replacements and prevents a prompt generated from an
+    older style bitmap from being treated as synced with the current one.
+    """
+    digest = hashlib.sha256()
+    valid = 0
+    for raw in paths or []:
+        try:
+            p = Path(raw).expanduser().resolve()
+            digest.update(str(p).encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+            if not p.is_file():
+                digest.update(b"MISSING\0")
+                continue
+            valid += 1
+            with p.open("rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            digest.update(b"\0")
+        except Exception:
+            digest.update(str(raw).encode("utf-8", errors="replace"))
+            digest.update(b"\0ERR\0")
+    return f"{valid}:" + digest.hexdigest()
+
+
+def _reference_manifest(paths):
+    """Return lightweight diagnostics proving which files were actually submitted."""
+    rows = []
+    for raw in paths or []:
+        item = {"path": str(raw)}
+        try:
+            p = Path(raw).expanduser().resolve()
+            item["resolved_path"] = str(p)
+            if p.is_file():
+                item["size"] = int(p.stat().st_size)
+                h = hashlib.sha256()
+                with p.open("rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(chunk)
+                item["sha256"] = h.hexdigest()
+            else:
+                item["missing"] = True
+        except Exception as exc:
+            item["error"] = str(exc)
+        rows.append(item)
+    return rows
+
+
+def _collection_and_index(props, ref_kind):
+    mapping = {
+        "PRODUCT": (props.product_images, "product_image_index"),
+        "PERSON": (props.person_images, "person_image_index"),
+        "STYLE": (props.style_images, "style_image_index"),
+    }
+    return mapping[ref_kind]
+
+
+def _mark_reference_changed(props, ref_kind):
+    """Invalidate style-derived prompt state when the style reference set changes."""
+    if ref_kind != "STYLE":
+        return
+    props.style_reference_revision = int(getattr(props, "style_reference_revision", 0)) + 1
+    props.style_prompt_dirty = True
+
+
+def _resolve_reference_index(props, ref_kind, requested_index=-1):
+    collection, index_attr = _collection_and_index(props, ref_kind)
+    if not collection:
+        return collection, index_attr, -1
+    if requested_index is None or int(requested_index) < 0:
+        idx = min(getattr(props, index_attr), len(collection) - 1)
+    else:
+        idx = max(0, min(int(requested_index), len(collection) - 1))
+        setattr(props, index_attr, idx)
+    return collection, index_attr, idx
+
+
+def _load_reference_image(filepath):
+    image = bpy.data.images.load(str(filepath), check_existing=True)
+    # If the same path was overwritten externally, Blender may return an existing
+    # datablock with stale pixels. Reload it before using it as the current ref.
+    try:
+        image.reload()
+    except Exception:
+        pass
+    return image
+
+
+def _append_reference_from_path(props, ref_kind, filepath):
+    collection, index_attr = _collection_and_index(props, ref_kind)
+    if len(collection) >= MAX_REFERENCES_PER_KIND:
+        raise RuntimeError(f"每类参考图最多 {MAX_REFERENCES_PER_KIND} 张。")
+    image = _load_reference_image(filepath)
+    item = collection.add()
+    item.image = image
+    item.source_path = str(filepath)
+    setattr(props, index_attr, len(collection) - 1)
+    return item
+
+
+def _replace_style_set(props, filepaths):
+    """Atomically replace the current style set after new images load successfully."""
+    loaded = []
+    failures = []
+    for filepath in list(filepaths or [])[:MAX_REFERENCES_PER_KIND]:
+        try:
+            loaded.append((str(filepath), _load_reference_image(filepath)))
+        except Exception as exc:
+            failures.append(f"{Path(filepath).name}: {exc}")
+    if not loaded:
+        return 0, failures
+
+    collection, index_attr = _collection_and_index(props, "STYLE")
+    collection.clear()
+    for filepath, image in loaded:
+        item = collection.add()
+        item.image = image
+        item.source_path = filepath
+    setattr(props, index_attr, 0)
+    _mark_reference_changed(props, "STYLE")
+    return len(loaded), failures
+
+
+class _BaseAsyncOperator(Operator):
+    _timer = None
+    _thread = None
+    _result = None
+    _error = None
+    _started_at = 0.0
+    _estimated_total = 60.0
+    _origin_scene = None
+
+    @classmethod
+    def poll(cls, context):
+        return not _ACTIVE_LOCK.locked()
+
+    def _start_thread(self, context, target):
+        if not _ACTIVE_LOCK.acquire(blocking=False):
+            self.report({"WARNING"}, "已有 AI / 登录任务正在运行。")
+            return False
+        self._owns_lock = True
+        self._ownership_guard = threading.Lock()
+        self._detached = threading.Event()
+        self._origin_scene = context.scene
+        self._result = None
+        self._error = None
+        self._started_at = time.time()
+
+        def runner():
+            try:
+                self._result = target()
+            except Exception as exc:
+                self._error = (exc, traceback.format_exc())
+            finally:
+                if self._detached.is_set():
+                    self._release_lock()
+
+        self._thread = threading.Thread(target=runner, daemon=True, name="WondfulAIWorker")
+        try:
+            wm = context.window_manager
+            self._timer = wm.event_timer_add(0.25, window=context.window)
+            wm.modal_handler_add(self)
+            self._thread.start()
+        except Exception as exc:
+            self._cleanup(context)
+            _status(context.scene.wondful_ai, "ERROR", str(exc))
+            self.report({"ERROR"}, str(exc))
+            return False
+        return True
+
+    def modal(self, context, event):
+        try:
+            scene_exists = self._origin_scene in list(bpy.data.scenes)
+        except ReferenceError:
+            scene_exists = False
+        if not scene_exists:
+            self._cleanup(context)
+            return {"CANCELLED"}
+        # Postprocessing, metadata and export must use the submitting scene.
+        try:
+            with context.temp_override(scene=self._origin_scene):
+                return self._modal(context, event)
+        except Exception as exc:
+            self._cleanup(context)
+            _status(self._origin_scene.wondful_ai, "ERROR", f"任务收尾失败：{exc}")
+            self.report({"ERROR"}, f"任务收尾失败：{exc}")
+            return {"CANCELLED"}
+
+    def _progress_update(self, props, floor=0.10, ceiling=0.88):
+        elapsed = max(0.0, time.time() - self._started_at)
+        frac = min(1.0, elapsed / max(1.0, self._estimated_total))
+        props.progress = floor + (ceiling - floor) * min(0.98, frac)
+        props.eta_seconds = max(0, int(self._estimated_total - elapsed))
+        props.task_phase = getattr(self, "_phase", "")
+
+    def _release_lock(self):
+        with self._ownership_guard:
+            if self._owns_lock:
+                self._owns_lock = False
+                _ACTIVE_LOCK.release()
+
+    def _cleanup(self, context):
+        if self._timer:
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except (ReferenceError, RuntimeError):
+                pass
+            self._timer = None
+        # Blender may cancel a modal on window close while the CLI is still busy.
+        # Retain exclusivity until that worker exits; never release another task's lock.
+        self._detached.set()
+        if not self._thread or not self._thread.is_alive():
+            self._release_lock()
+
+    def cancel(self, context):
+        self._cleanup(context)
+        try:
+            _status(self._origin_scene.wondful_ai, "ERROR", "任务窗口已关闭；后台请求结束后可重新操作。")
+        except (ReferenceError, AttributeError):
+            pass
+
+
+class WONDFUL_OT_refresh_models(_BaseAsyncOperator):
+    bl_idname = "wondful.refresh_models"
+    bl_label = "刷新模型列表"
+    bl_description = "从当前 CLI 读取具体推理模型 ID；不发起润色或生图请求"
+
+    def execute(self, context):
+        props, prefs = context.scene.wondful_ai, _addon_prefs(context)
+        provider = _analysis_provider(props, prefs)
+        self._catalog_provider = provider["id"]
+        cli = provider["discover"]()
+        if not cli:
+            self.report({"ERROR"}, "未找到当前服务的 CLI，请先检测安装或选择路径。")
+            return {"CANCELLED"}
+        setattr(props, self._catalog_provider + "_cli_resolved", cli)
+        _status(props, "REFRESHING_MODELS")
+        setattr(props, self._catalog_provider + "_models_message", "正在读取模型列表…")
+        if not self._start_thread(context, lambda: discover_models(self._catalog_provider, cli, cwd=CONFIG_DIR)):
+            _status(props, "IDLE")
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if self._thread and self._thread.is_alive():
+            return {"RUNNING_MODAL"}
+        self._cleanup(context)
+        props = self._origin_scene.wondful_ai
+        attr = self._catalog_provider + "_models_message"
+        if self._error:
+            message = safe_diagnostic(str(self._error[0]))
+            setattr(props, attr, "刷新失败；已有列表未更新。" + message)
+            _status(props, "ERROR", message)
+            return {"CANCELLED"}
+        collection = getattr(props, self._catalog_provider + "_models")
+        collection.clear()
+        for model in self._result:
+            item = collection.add()
+            item.name, item.label = model["id"], model["label"]
+            item.description, item.is_default = model["description"], model["default"]
+        setattr(props, attr, f"已读取 {len(collection)} 个模型 · 点击模型框选择")
+        _status(props, "IDLE")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_model_default(Operator):
+    bl_idname = "wondful.model_default"
+    bl_label = "使用 CLI 默认模型"
+
+    @classmethod
+    def poll(cls, context):
+        return not _ACTIVE_LOCK.locked()
+
+    def execute(self, context):
+        props, prefs = context.scene.wondful_ai, _addon_prefs(context)
+        setattr(prefs, "antigravity_model" if props.analysis_provider == "ANTIGRAVITY" else "codex_model", "")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_codex_check(_BaseAsyncOperator):
+    bl_idname = "wondful.codex_check"
+    bl_label = "检测 Codex"
+    bl_description = "检测 Codex CLI 与 ChatGPT OAuth 登录状态"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        props.codex_account_message = "正在检测…"
+        self._estimated_total = 8.0
+
+        if not self._start_thread(context, lambda: get_account_status(prefs.codex_cli_path)):
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if self._thread and self._thread.is_alive():
+            return {"RUNNING_MODAL"}
+        props = self._origin_scene.wondful_ai
+        self._cleanup(context)
+        if self._error:
+            exc, _tb = self._error
+            props.codex_account_state = "ERROR"
+            props.codex_account_message = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        _apply_account_status(props, self._result)
+        if self._result.logged_in:
+            _status(props, "IDLE")
+            props.progress = 0.0
+            props.eta_seconds = 0
+        self.report({"INFO"}, "Codex 已登录 ChatGPT。" if self._result.logged_in else self._result.message)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_codex_login(_BaseAsyncOperator):
+    bl_idname = "wondful.codex_login"
+    bl_label = "使用 ChatGPT 登录"
+    bl_description = "调用官方 Codex OAuth 登录；通常会自动打开浏览器"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        _status(props, "AUTHENTICATING")
+        props.progress = 0.05
+        props.eta_seconds = 0
+        props.codex_account_message = "正在启动 ChatGPT OAuth，请在浏览器完成登录…"
+        self._estimated_total = 90.0
+
+        if not self._start_thread(context, lambda: login_chatgpt(prefs.codex_cli_path, timeout=600)):
+            _status(props, "IDLE")
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        props = self._origin_scene.wondful_ai
+        if self._thread and self._thread.is_alive():
+            # OAuth duration is user-controlled, so only show activity rather than a fake ETA.
+            elapsed = max(0.0, time.time() - self._started_at)
+            props.progress = min(0.85, 0.05 + elapsed / 180.0)
+            return {"RUNNING_MODAL"}
+
+        self._cleanup(context)
+        props.progress = 0.0
+        props.eta_seconds = 0
+        if self._error:
+            exc, _tb = self._error
+            props.codex_account_state = "ERROR"
+            props.codex_account_message = str(exc)
+            _status(props, "ERROR", str(exc))
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        _apply_account_status(props, self._result)
+        _status(props, "IDLE")
+        self.report({"INFO"}, "ChatGPT OAuth 登录成功，Blender 已可调用 Codex。")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_codex_logout(Operator):
+    bl_idname = "wondful.codex_logout"
+    bl_label = "退出 ChatGPT"
+    bl_description = "调用官方 codex logout；插件自身不保存 OAuth Token"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        try:
+            status = codex_logout(prefs.codex_cli_path)
+        except Exception as exc:
+            props.codex_account_state = "ERROR"
+            props.codex_account_message = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        _apply_account_status(props, status)
+        self.report({"INFO"}, "已退出 Codex ChatGPT 登录。")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_antigravity_check(_BaseAsyncOperator):
+    bl_idname = "wondful.antigravity_check"
+    bl_label = "检测 AGY 安装"
+    bl_description = "仅检测 CLI 路径与版本，不发起模型请求或浏览器登录"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        props.antigravity_account_message = "正在检测 AGY 路径与版本…"
+        self._estimated_total = 12.0
+        if not self._start_thread(
+            context,
+            lambda: get_antigravity_account_status(prefs.antigravity_cli_path, live_check=False),
+        ):
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if self._thread and self._thread.is_alive():
+            return {"RUNNING_MODAL"}
+        props = self._origin_scene.wondful_ai
+        self._cleanup(context)
+        if self._error:
+            exc, _tb = self._error
+            props.antigravity_account_state = "ERROR"
+            props.antigravity_account_message = str(exc)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        previous_state, previous_cli = props.antigravity_account_state, props.antigravity_cli_resolved
+        _apply_antigravity_account_status(props, self._result)
+        if self._result.installed and previous_state == "LOGGED_IN" and previous_cli == self._result.cli_path:
+            props.antigravity_account_state = "LOGGED_IN"
+        if self._result.logged_in:
+            _status(props, "IDLE")
+            props.progress = 0.0
+            props.eta_seconds = 0
+        self.report({"INFO"}, "Antigravity 已通过 Google 账号登录。" if self._result.logged_in else self._result.message)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_antigravity_login(_BaseAsyncOperator):
+    bl_idname = "wondful.antigravity_login"
+    bl_label = "验证登录"
+    bl_description = "使用选定模型检查官方 CLI 登录；发起一次最小文本请求，不生成图片"
+    allow_interactive: BoolProperty(default=False, options={"SKIP_SAVE"})
+
+    def execute(self, context):
+        global _AGY_AUTH, _AGY_AUTH_OWNER
+        props, prefs = context.scene.wondful_ai, _addon_prefs(context)
+        cli = discover_antigravity_cli(prefs.antigravity_cli_path or getattr(props, "antigravity_cli_resolved", ""))
+        if not cli:
+            props.antigravity_account_state = "NOT_INSTALLED"
+            self.report({"ERROR"}, "未找到 agy，请在设置中选择 CLI 路径。")
+            return {"CANCELLED"}
+        self._auth = AuthSession(cli, cwd=CONFIG_DIR, version=props.antigravity_cli_version,
+                                 model=prefs.antigravity_model, allow_interactive=self.allow_interactive,
+                                 timeout=600 if self.allow_interactive else 120)
+        _AGY_AUTH = self._auth
+        _AGY_AUTH_OWNER = self
+        context.window_manager.wondful_auth_code = ""
+        props.antigravity_cli_resolved = cli
+        props.auth_stage, props.auth_detail = "STARTING", ""
+        _status(props, "AUTHENTICATING")
+        self._estimated_total = 90.0
+
+        def job():
+            installation = get_antigravity_account_status(cli, live_check=False)
+            self._auth.version = installation.version
+            return self._auth.run()
+
+        if not self._start_thread(context, job):
+            _AGY_AUTH = None
+            _AGY_AUTH_OWNER = None
+            _status(props, "IDLE")
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        global _AGY_AUTH, _AGY_AUTH_OWNER
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        props = self._origin_scene.wondful_ai
+        snapshot = self._auth.snapshot()
+        props.auth_stage = snapshot["stage"]
+        props.auth_detail = snapshot["detail"] or snapshot["message"]
+        props.auth_has_url = snapshot["has_url"]
+        if self._thread and self._thread.is_alive():
+            return {"RUNNING_MODAL"}
+        self._cleanup(context)
+        context.window_manager.wondful_auth_code = ""
+        if _AGY_AUTH is self._auth:
+            _AGY_AUTH = None
+            _AGY_AUTH_OWNER = None
+        props.auth_has_url = False
+        if self._error:
+            _status(props, "ERROR", safe_diagnostic(str(self._error[0])))
+            return {"CANCELLED"}
+        _apply_antigravity_account_status(props, self._result)
+        availability = snapshot["image_tool_available"]
+        props.agy_image_capability = "UNKNOWN" if availability is None else ("AVAILABLE" if availability else "NOT_LISTED")
+        if self._result.logged_in:
+            _status(props, "IDLE")
+            self.report({"INFO"}, self._result.message)
+        elif snapshot["stage"] == "CANCELED":
+            _status(props, "IDLE")
+        else:
+            _status(props, "ERROR", self._result.message)
+            self.report({"ERROR"}, self._result.message)
+        return {"FINISHED"}
+
+    def _cleanup(self, context):
+        if self._thread and self._thread.is_alive():
+            self._auth.cancel()
+        super()._cleanup(context)
+
+    def cancel(self, context):
+        self._auth.cancel()
+        context.window_manager.wondful_auth_code = ""
+        super().cancel(context)
+
+
+class WONDFUL_OT_antigravity_submit_code(Operator):
+    bl_idname = "wondful.antigravity_submit_code"
+    bl_label = "提交授权码"
+
+    def execute(self, context):
+        code = context.window_manager.wondful_auth_code
+        context.window_manager.wondful_auth_code = ""
+        try:
+            if _AGY_AUTH is None:
+                raise RuntimeError("本次登录已结束，请重新连接。")
+            _AGY_AUTH.submit_code(code)
+        except Exception as exc:
+            self.report({"ERROR"}, safe_diagnostic(str(exc), [code]))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_antigravity_auth_cancel(Operator):
+    bl_idname = "wondful.antigravity_auth_cancel"
+    bl_label = "取消连接"
+
+    def execute(self, context):
+        cancel_auth_session()
+        context.window_manager.wondful_auth_code = ""
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_antigravity_auth_browser(Operator):
+    bl_idname = "wondful.antigravity_auth_browser"
+    bl_label = "打开本次登录页"
+
+    def execute(self, context):
+        url = _AGY_AUTH.browser_url() if _AGY_AUTH else ""
+        if not url:
+            self.report({"WARNING"}, "当前没有有效登录链接。")
+            return {"CANCELLED"}
+        webbrowser.open(url)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_antigravity_terminal(Operator):
+    bl_idname = "wondful.antigravity_terminal"
+    bl_label = "Google 登录"
+    bl_description = "打开官方 AGY 交互终端，完成首次设置和 Google 登录；完成后回插件点验证登录"
+
+    @classmethod
+    def poll(cls, context):
+        return not _ACTIVE_LOCK.locked()
+
+    def execute(self, context):
+        prefs, props = _addon_prefs(context), context.scene.wondful_ai
+        try:
+            cli = discover_antigravity_cli(prefs.antigravity_cli_path or props.antigravity_cli_resolved)
+            message = open_antigravity_google_login(cli or "")
+            props.antigravity_cli_resolved = cli or ""
+        except Exception as exc:
+            self.report({"ERROR"}, safe_diagnostic(str(exc)))
+            return {"CANCELLED"}
+        props.antigravity_account_message = message
+        _status(props, "IDLE")
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_copy_diagnostics(Operator):
+    bl_idname = "wondful.copy_diagnostics"
+    bl_label = "复制诊断信息"
+
+    def execute(self, context):
+        import platform
+        props, prefs = context.scene.wondful_ai, _addon_prefs(context)
+        provider = _analysis_provider(props, prefs)
+        data = {
+            "addon": "3.1.1", "platform": platform.platform(),
+            "blender": getattr(bpy.app, "version_string", "unknown"),
+            "provider": provider["id"], "cli_path": provider["discover"]() or provider["cli_path"],
+            "addon_path": str(Path(__file__).resolve().parent),
+            "codex_version": props.codex_cli_version, "codex_state": props.codex_account_state,
+            "agy_version": props.antigravity_cli_version, "agy_state": props.antigravity_account_state,
+            "auth_stage": props.auth_stage, "auth_detail": safe_diagnostic(props.auth_detail),
+            "image_tool": props.agy_image_capability if provider["id"] == "antigravity" else "RUNTIME_MANAGED",
+            "agent_model": provider["model"] or "default", "profile": prompt_profiles.metadata(provider["id"], provider["model"]),
+            "model_catalog_count": len(getattr(props, provider["id"] + "_models")),
+            "model_catalog_status": safe_diagnostic(getattr(props, provider["id"] + "_models_message")),
+            "reference_bundle": props.last_reference_bundle,
+            "error": safe_diagnostic(props.last_error),
+        }
+        context.window_manager.clipboard = json.dumps(data, ensure_ascii=False, indent=2)
+        self.report({"INFO"}, "已复制诊断信息（不含授权码或 OAuth 链接）。")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
+    bl_idname = "wondful.polish_prompt"
+    bl_label = "AI润色"
+    bl_description = "根据你输入的提示词和产品／人物／环境参考图润色，写回同一个输入框；无需先设置相机"
+
+    _session = None
+    _width = 0
+    _height = 0
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+
+        provider = _analysis_provider(props, prefs)
+        if not provider["discover"]():
+            if provider["id"] == "antigravity":
+                props.antigravity_account_state = "NOT_INSTALLED"
+                props.antigravity_account_message = "未检测到 Antigravity CLI"
+            else:
+                props.codex_account_state = "NOT_INSTALLED"
+                props.codex_account_message = "未检测到 Codex CLI"
+            self.report({"ERROR"}, f"未检测到 {provider['label']} CLI。")
+            return {"CANCELLED"}
+
+        cleanup_old_sessions()
+        self._session = create_session()
+        # Appearance polish needs the user's words and references, not camera geometry.
+        self._width, self._height, method = 0, 0, "TEXT_AND_REFERENCES"
+        refs = _reference_paths(props)
+        ref_instructions = _reference_instructions(props)
+        product = copy_references(refs["product"], self._session, "product_reference")
+        person = copy_references(refs["person"], self._session, "person_reference")
+        style = copy_references(refs["style"], self._session, "style_reference")
+        self._reference_counts = {"product": len(product), "person": len(person), "style": len(style)}
+        product_upload = [prepare_reference_for_upload(p) for p in product]
+        person_upload = [prepare_reference_for_upload(p) for p in person]
+        style_upload = [prepare_reference_for_upload(p) for p in style]
+        # Keep attachment order exactly aligned with prompt_engine reference numbering:
+        # Product -> Person -> Environment; no Camera Base in the polish turn.
+        image_paths = [*product_upload, *person_upload, *style_upload]
+        camera_w, camera_h = camera_output_dimensions(context)
+        self._camera_output_size = (camera_w, camera_h)
+        self._camera_name_at_start = context.scene.camera.name if context.scene.camera else ""
+        self._reference_sources_at_start = {kind: _reference_manifest(paths) for kind, paths in refs.items()}
+        self._reference_instructions_at_start = ref_instructions
+        self._style_revision_at_start = int(getattr(props, "style_reference_revision", 0))
+        self._style_fingerprint_at_start = _reference_fingerprint(refs["style"])
+        fingerprint_relevant = bool(len(props.style_images) > 0 or getattr(props, "style_sync_initialized", False))
+        self._style_refresh_requested = bool(
+            needs_reference_policy_refresh(props)
+            or prompt_profiles.needs_target_refresh(props, prefs)
+            or getattr(props, "style_prompt_dirty", False)
+            or int(getattr(props, "prompt_style_revision", 0)) != self._style_revision_at_start
+            or (fingerprint_relevant and str(getattr(props, "prompt_style_fingerprint", "")) != self._style_fingerprint_at_start)
+            or (len(props.style_images) > 0 and not bool(getattr(props, "style_sync_initialized", False)))
+        )
+
+        visible_prompt = _get_prompt_text(props)
+        self._prompt_at_start = visible_prompt
+        props.prompt_notice = ""
+        source_prompt = select_polish_source(props, visible_prompt, self._style_refresh_requested)
+        self._prompt_profile = prompt_profiles.metadata(provider["id"], provider["model"])
+        self._style_cache_key = prompt_profiles.style_cache_key(
+            self._style_fingerprint_at_start, ref_instructions["style"], provider["id"], provider["model"])
+        self._cached_style_summary = (getattr(props, "style_summary_cache", "")
+            if getattr(props, "style_summary_cache_key", "") == self._style_cache_key else "")
+        self._style_cache_hit = bool(self._cached_style_summary and style_upload)
+        self._phase = "准备参考图"
+
+
+        user_text = build_polish_user_text(
+            source_prompt, len(product), len(person), len(style), camera_w, camera_h,
+            style_refresh=self._style_refresh_requested,
+            include_camera=False,
+            product_instructions=ref_instructions["product"],
+            person_instructions=ref_instructions["person"],
+            style_instructions=ref_instructions["style"],
+        )
+
+        _status(props, "POLISHING")
+        props.progress = 0.05
+        props.eta_seconds = 30
+        props.last_session_id = self._session.session_id
+        props.last_capture_method = method
+        provider = _analysis_provider(props, prefs)
+        timing_key = f"{provider['id']}_polish"
+        self._provider_id = provider["id"]
+        self._provider_label = provider["label"]
+        self._timing_key = timing_key
+        self._estimated_total = average_timing(timing_key, 30.0)
+        if style_upload and not self._style_cache_hit:
+            # Style refresh deliberately performs a dedicated first pass that sees
+            # only the CURRENT style references. This mirrors the product spec:
+            # "first analyze the style image, then merge those visual features into
+            # the final prompt" and prevents legacy prompt text from winning.
+            self._estimated_total *= 1.7
+        cli_path = provider["cli_path"]
+        model = provider["model"]
+        polish_fn = provider["polish"]
+
+        def job():
+            final_user_text = user_text
+            self._style_summary = self._cached_style_summary
+            if style_upload and not self._style_cache_hit:
+                self._phase = "分析当前风格 (1/2)"
+                style_summary = polish_fn(
+                    system_prompt=STYLE_ANALYSIS_SYSTEM_PROMPT,
+                    user_text=(
+                        "请只读取本轮附带的当前环境／风格参考图，从零提取环境照明与视觉风格。首先明确产品在该环境下的受光、反射和阴影。"
+                        "不要参考 Blender 构图、产品身份、人物身份，也不要复用任何旧 Prompt 风格。"
+                        + (("\n" + _instruction_lines("风格参考图", ref_instructions["style"])) if _instruction_lines("风格参考图", ref_instructions["style"]) else "")
+                        + "\n环境主参考确定统一照明；逐图说明限定其他风格特征和辅助环境信息，不采用产品图的原有打光。"
+                    ),
+                    image_paths=style_upload,
+                    cwd=str(self._session.directory),
+                    explicit_path=cli_path,
+                    model=model,
+                    timeout=int(provider["polish_timeout"]),
+                )
+                self._style_summary = (style_summary or "").strip()
+            if self._style_summary:
+                final_user_text += (
+                    "\n\n【当前风格参考图独立分析结果｜本轮唯一风格依据】\n"
+                    + self._style_summary
+                    + "\n请用这段当前风格摘要彻底替换旧提示词中的色调、材质、布光、摄影、氛围和后期描述；"
+                      "旧风格与本摘要冲突时必须丢弃旧风格。"
+                )
+
+            self._phase = "适配生图模型提示词"
+            kwargs = dict(
+                system_prompt=prompt_profiles.system_prompt(BASE_SYSTEM_PROMPT, provider["id"]),
+                user_text=final_user_text,
+                image_paths=image_paths,
+                cwd=str(self._session.directory),
+                explicit_path=cli_path,
+                model=model,
+            )
+            kwargs["timeout"] = int(provider["polish_timeout"])
+            return polish_fn(**kwargs)
+
+        if not self._start_thread(context, job):
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        props = self._origin_scene.wondful_ai
+        if event.type == "TIMER":
+            if self._thread and self._thread.is_alive():
+                self._progress_update(props, 0.10, 0.90)
+                return {"RUNNING_MODAL"}
+            self._cleanup(context)
+            if self._error:
+                exc, _tb = self._error
+                if isinstance(exc, AntigravityNotLoggedInError):
+                    props.antigravity_account_state = "LOGGED_OUT"
+                    props.antigravity_account_message = str(exc)
+                elif isinstance(exc, AntigravityNotInstalledError):
+                    props.antigravity_account_state = "NOT_INSTALLED"
+                    props.antigravity_account_message = str(exc)
+                elif isinstance(exc, CodexNotLoggedInError):
+                    props.codex_account_state = "LOGGED_OUT"
+                    props.codex_account_message = str(exc)
+                elif isinstance(exc, CodexNotInstalledError):
+                    props.codex_account_state = "NOT_INSTALLED"
+                    props.codex_account_message = str(exc)
+                _status(props, "ERROR", str(exc))
+                props.progress = 0.0
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+
+            if getattr(self, "_provider_id", "codex") == "antigravity":
+                props.antigravity_account_state = "LOGGED_IN"
+            else:
+                props.codex_account_state = "LOGGED_IN"
+            polished = sanitize_appearance_prompt(self._result or "")
+            if not polished.strip():
+                _status(props, "ERROR", "AI 未返回有效外观提示词，已保留原内容。")
+                self.report({"ERROR"}, props.last_error)
+                return {"CANCELLED"}
+            if _get_prompt_text(props) != self._prompt_at_start:
+                suggestion = self._session.directory / "prompt_ai_suggestion.txt"
+                suggestion.write_text(polished, encoding="utf-8")
+                draft = bpy.data.texts.new("Wondful Prompt · AI 润色建议")
+                draft.write(polished)
+                draft.use_fake_user = True
+                props.prompt_notice = "已保留你的手动修改；AI 结果在 Text Editor 的“AI 润色建议”中。"
+                props.progress = 1.0
+                props.eta_seconds = 0
+                _status(props, "IDLE")
+                self.report({"WARNING"}, props.prompt_notice)
+                return {"FINISHED"}
+            _set_prompt_text(props, polished)
+            final_prompt_now = _get_prompt_text(props)
+            props.last_ai_prompt = final_prompt_now
+            props.prompt_target_key = self._prompt_profile["target_key"]
+            current_style_revision = int(getattr(props, "style_reference_revision", 0))
+            current_style_fingerprint = _reference_fingerprint(_reference_paths(props)["style"])
+            same_style_set = (
+                current_style_revision == int(getattr(self, "_style_revision_at_start", current_style_revision))
+                and current_style_fingerprint == str(getattr(self, "_style_fingerprint_at_start", current_style_fingerprint))
+            )
+            if same_style_set:
+                props.prompt_style_revision = current_style_revision
+                props.prompt_style_fingerprint = current_style_fingerprint
+                props.style_prompt_dirty = False
+                props.style_sync_initialized = True
+                props.prompt_reference_policy_version = REFERENCE_POLICY_VERSION
+                props.style_summary_cache_key = self._style_cache_key
+                props.style_summary_cache = self._style_summary
+            else:
+                # The user changed style references (or replaced bytes at the same
+                # path) while AI was polishing. Never validate a stale prompt.
+                props.style_prompt_dirty = True
+            props.progress = 1.0
+            props.eta_seconds = 0
+            _status(props, "IDLE")
+            final_prompt = _get_prompt_text(props)
+            self._session.prompt_file.write_text(final_prompt, encoding="utf-8")
+            elapsed = time.time() - self._started_at
+            record_timing(getattr(self, "_timing_key", "codex_polish"), elapsed)
+            save_metadata(
+                self._session,
+                {
+                    "type": "prompt_polish",
+                    "prompt_profile": self._prompt_profile,
+                    "style_cache_hit": self._style_cache_hit,
+                    "engine": f"{getattr(self, '_provider_id', 'codex')}_oauth",
+                    "analysis_provider": getattr(self, "_provider_id", "codex"),
+                    "camera_reference_size": [self._width, self._height],
+                    "camera_output_size": list(self._camera_output_size),
+                    "camera_name": self._camera_name_at_start,
+                    "reference_bundle": getattr(self, "_reference_bundle", {}),
+                    "reference_counts": dict(self._reference_counts or {}),
+                    "reference_sources": self._reference_sources_at_start,
+                    "reference_instructions": self._reference_instructions_at_start,
+                    "style_fingerprint": str(getattr(self, "_style_fingerprint_at_start", "")),
+                    "style_summary": str(getattr(self, "_style_summary", "")),
+                    "capture_method": props.last_capture_method,
+                    "generation_time": elapsed,
+                    "remote_generation_seconds": props.last_generation_seconds,
+                    "remote_audit_seconds": props.last_audit_seconds,
+                },
+            )
+            if props.style_prompt_dirty:
+                self.report({"WARNING"}, "提示词已生成，但风格图在生成期间又发生变化；请再次重新生成提示词。")
+            else:
+                self.report({"INFO"}, f"{getattr(self, '_provider_label', 'Codex')} 提示词生成完成，可以开始 AI 渲染。")
+            return {"FINISHED"}
+        return {"PASS_THROUGH"}
+
+
+
+class WONDFUL_OT_ai_render(_BaseAsyncOperator):
+    bl_idname = "wondful.ai_render"
+    bl_label = "AI渲染"
+    bl_description = "重新捕获当前最新 Blender Scene Camera Frame，并由当前 AI Provider 完成最终生图"
+
+    _session = None
+    _width = 0
+    _height = 0
+    _target_w = 0
+    _target_h = 0
+    _reference_counts = None
+    _structure = None
+
+    @staticmethod
+    def _variant_rank(variant: dict) -> tuple[bool, int]:
+        canvas = variant.get("best_canvas") or {}
+        try:
+            score = int(variant.get("best_score", -1))
+        except (TypeError, ValueError):
+            score = -1
+        return bool(canvas.get("matches") or canvas.get("fit_compatible")), score
+
+    def _drain_completed_variants(self, props) -> None:
+        """Aspect-fit and export every finished variant as soon as it is available."""
+        queue = getattr(self, "_completed_variants", None)
+        if queue is None:
+            return
+        camera_w, camera_h = self._camera_output_size
+        while True:
+            try:
+                variant = queue.get_nowait()
+            except Empty:
+                break
+            try:
+                variant_index = int(variant.get("variant", 0))
+                expected = int(getattr(self, "_variant_count", RENDER_VARIANT_COUNT))
+                if variant_index < 1 or variant_index > expected:
+                    raise ValueError(f"第 {variant_index} 张候选图编号无效。")
+                if variant_index in self._exported_by_variant:
+                    continue
+                source = Path(str(variant.get("best_path", ""))).expanduser()
+                if not source.is_file():
+                    raise FileNotFoundError(f"第 {variant_index} 张候选图不存在: {source}")
+                variant_final = self._session.directory / f"output_variant_{variant_index:02d}.png"
+                variant_final, _variant_postprocessed = enforce_aspect_ratio(
+                    str(source), str(variant_final), camera_w, camera_h
+                )
+                if image_dimensions(variant_final) != (camera_w, camera_h):
+                    raise RuntimeError(f"第 {variant_index} 张结果无法适配为 {camera_w}×{camera_h}。")
+                exported = export_result(
+                    variant_final,
+                    self._output_dir_at_start,
+                    self._scene_name_at_start,
+                    self._camera_name_at_start,
+                    self._session.session_id,
+                )
+                self._exported_by_variant[variant_index] = Path(exported)
+                self._exported_variant_records[variant_index] = variant
+            except Exception as exc:
+                self._export_errors.append(str(exc))
+
+        if not self._exported_by_variant:
+            return
+        best_index = max(
+            self._exported_variant_records,
+            key=lambda index: self._variant_rank(self._exported_variant_records[index]),
+        )
+        exported_paths = [
+            str(self._exported_by_variant[index])
+            for index in sorted(self._exported_by_variant)
+        ]
+        best_exported = self._exported_by_variant[best_index]
+        props.variant_count = len(exported_paths)
+        props.last_export_path = str(best_exported)
+        props.last_result_path = str(best_exported)
+        props.last_export_paths = json.dumps(exported_paths, ensure_ascii=False)
+        try:
+            props.result_image = load_image(str(best_exported), "Wondful_Result")
+        except Exception:
+            pass
+
+    def execute(self, context):
+        self._request_started_at = time.perf_counter()
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        provider = _analysis_provider(props, prefs)
+        planned_variant_count = render_variant_count(provider["id"])
+        if not provider["imagegen_enabled"]:
+            self.report({"ERROR"}, f"{provider['label']} 生图已在插件偏好设置中关闭。")
+            return {"CANCELLED"}
+
+        if not provider["discover"]():
+            if provider["id"] == "antigravity":
+                props.antigravity_account_state = "NOT_INSTALLED"
+                props.antigravity_account_message = "未检测到 Antigravity CLI"
+            else:
+                props.codex_account_state = "NOT_INSTALLED"
+                props.codex_account_message = "未检测到 Codex CLI"
+            self.report({"ERROR"}, f"未检测到 {provider['label']} CLI。")
+            return {"CANCELLED"}
+
+        if prompt_profiles.needs_target_refresh(props, prefs):
+            self.report({"WARNING"}, "生图引擎或提示词规则已变化，请先点‘适配当前引擎’重新生成提示词。")
+            return {"CANCELLED"}
+        self._prompt_profile = prompt_profiles.metadata(provider["id"], provider["model"])
+        current_prompt = _get_prompt_text(props)
+        if not current_prompt:
+            self.report({"ERROR"}, "提示词为空。可以先输入简短需求，或点击重新生成提示词。")
+            return {"CANCELLED"}
+
+        current_style_revision = int(getattr(props, "style_reference_revision", 0))
+        prompt_style_revision = int(getattr(props, "prompt_style_revision", 0))
+        current_style_fingerprint = _reference_fingerprint(_reference_paths(props)["style"])
+        self._style_fingerprint_at_render = current_style_fingerprint
+        fingerprint_relevant = bool(len(props.style_images) > 0 or getattr(props, "style_sync_initialized", False))
+        policy_needs_refresh = needs_reference_policy_refresh(props)
+        style_needs_refresh = bool(
+            policy_needs_refresh
+            or getattr(props, "style_prompt_dirty", False)
+            or prompt_style_revision != current_style_revision
+            or (fingerprint_relevant and str(getattr(props, "prompt_style_fingerprint", "")) != current_style_fingerprint)
+            or (len(props.style_images) > 0 and not bool(getattr(props, "style_sync_initialized", False)))
+        )
+        if style_needs_refresh:
+            message = ("参考职责已更新为产品造型、环境打光，请先重新生成提示词。" if policy_needs_refresh
+                       else "环境／风格参考图尚未与当前提示词同步，请先重新生成提示词。")
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+
+        # 2.19: Structure Lock no longer infers product meshes from the whole scene
+        # or from red materials. When structure guides are enabled, one explicit
+        # product Collection is required and every visible Mesh inside it is product.
+        if prefs.structure_guides_enabled and prefs.strict_composition_lock and not getattr(props, "product_collection", None):
+            self.report({"ERROR"}, "Blender Structure Lock 已开启，请先选择“产品集合”。集合里的 Mesh 将全部视为产品。")
+            return {"CANCELLED"}
+
+        configured_output = (props.output_directory or "").strip() or (prefs.output_directory or "").strip()
+        try:
+            self._output_dir_at_start = resolve_output_directory(context, configured_output)
+            preflight_output_directory(self._output_dir_at_start)
+        except Exception as exc:
+            self.report({"ERROR"}, f"输出目录不可用：{exc}")
+            return {"CANCELLED"}
+        self._scene_name_at_start = context.scene.name
+        self._camera_name_at_start = context.scene.camera.name if context.scene.camera else "Camera"
+        cleanup_old_sessions()
+        self._session = create_session()
+        try:
+            self._width, self._height, method = capture_camera_reference(context, str(self._session.viewport_reference))
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        refs = _reference_paths(props)
+        ref_instructions = _reference_instructions(props)
+        product = copy_references(refs["product"], self._session, "product_reference")
+        person = copy_references(refs["person"], self._session, "person_reference")
+        style = copy_references(refs["style"], self._session, "style_reference")
+        self._reference_counts = {"product": len(product), "person": len(person), "style": len(style)}
+        product_upload = [prepare_reference_for_upload(p) for p in product]
+        person_upload = [prepare_reference_for_upload(p) for p in person]
+        style_upload = [prepare_reference_for_upload(p) for p in style]
+
+        camera_w, camera_h = camera_output_dimensions(context)
+        self._camera_output_size = (camera_w, camera_h)
+        self._reference_sources_at_start = {kind: _reference_manifest(paths) for kind, paths in refs.items()}
+        self._reference_instructions_at_start = ref_instructions
+        render_mode = str(getattr(props, "render_mode", "STANDARD") or "STANDARD")
+        structure = {"enabled": False}
+        if prefs.structure_guides_enabled and prefs.strict_composition_lock:
+            try:
+                structure = build_structure_packet(
+                    context,
+                    props,
+                    self._session.directory,
+                    camera_w,
+                    camera_h,
+                    camera_base_path=str(self._session.viewport_reference),
+                    render_mode=render_mode,
+                )
+            except Exception as exc:
+                structure = {"enabled": False, "error": str(exc)}
+            if not structure.get("enabled"):
+                reason = structure.get("reason") or structure.get("source_mode") or structure.get("error") or "UNKNOWN"
+                self.report({"ERROR"}, f"产品集合无法生成 Structure Packet：{reason}。请确认集合中有当前相机可见的 Mesh。")
+                return {"CANCELLED"}
+        self._structure = structure
+        props.last_structure_note = (
+            "结构图：原生相机数据，已统一白模画布。" if structure.get("native_passes") else
+            "结构图已降级为投影近似；遮挡和深度需人工检查。" if structure.get("enabled") else
+            "未启用结构图，仅使用白模参考。"
+        )
+        effective_long_edge = min(int(prefs.long_edge), 1280) if render_mode == "FAST" else int(prefs.long_edge)
+        self._render_mode = render_mode
+        self._effective_long_edge = effective_long_edge
+        self._target_w, self._target_h, target_size = compute_target_size(camera_w, camera_h, effective_long_edge)
+        render_prompt = build_render_prompt(
+            current_prompt,
+            camera_w,
+            camera_h,
+            len(product),
+            len(person),
+            len(style),
+            target_size=target_size,
+            strict_lock=bool(prefs.strict_composition_lock),
+            structure_guide=bool(structure.get("enabled")),
+            structure_packet=structure if structure.get("enabled") else None,
+            product_instructions=ref_instructions["product"],
+            person_instructions=ref_instructions["person"],
+            style_instructions=ref_instructions["style"],
+        )
+        render_prompt = prompt_profiles.render_brief(render_prompt, provider["id"])
+        structure_refs = list(structure.get("generation_reference_paths", [])) if structure.get("enabled") else []
+        camera_base = str(structure.get("camera_base_path") or self._session.viewport_reference)
+        # Two free slots are needed if a later strict repair adds a candidate and
+        # union Mask. Compose sheets on Blender's main thread, before the worker.
+        reference_limit = int(provider.get("reference_limit", MAX_IMAGE_PATHS))
+        # Codex currently has room for a two-image masked-repair reserve. AGY's
+        # generate_image endpoint accepts only three paths total, so its repair
+        # pass is reduced to the camera + edit base + mask below instead of
+        # reserving slots that would make the initial bundle impossible.
+        reserve = 2 if (reference_limit >= 5 and render_mode == "STRICT" and prefs.auto_alignment_retry
+                        and prefs.masked_alignment_repair and structure.get("edit_mask_path")
+                        and int(prefs.alignment_max_attempts) > 1) else 0
+        try:
+            references, bundle_note, self._reference_bundle = prepare_bundle(
+                [("camera", [camera_base]), ("structure", structure_refs),
+                 ("product", product_upload), ("person", person_upload), ("environment", style_upload)],
+                self._session.directory, reserve=reserve, limit=reference_limit,
+            )
+            render_prompt += bundle_note
+            self._session.prompt_file.write_text(render_prompt, encoding="utf-8")
+            (self._session.directory / "reference_bundle.json").write_text(
+                json.dumps(self._reference_bundle, ensure_ascii=False, indent=2), encoding="utf-8")
+            props.last_reference_bundle = json.dumps({k: v for k, v in self._reference_bundle.items()
+                                                     if k != "groups"}, ensure_ascii=False)
+        except Exception as exc:
+            _status(props, "ERROR", f"参考图整理失败：{exc}")
+            self.report({"ERROR"}, props.last_error)
+            return {"CANCELLED"}
+
+        self._preparation_seconds = time.perf_counter() - self._request_started_at
+        props.last_preparation_seconds = self._preparation_seconds
+        props.last_total_seconds = 0.0
+        _status(props, "RENDERING")
+        props.last_export_path = ""
+        props.last_export_paths = ""
+        props.variant_count = 1
+        props.alignment_score = -1.0
+        props.alignment_message = ""
+        props.last_canvas_warning = ""
+        props.last_canvas_fit = False
+        props.alignment_attempts = 0
+        props.progress = 0.05
+        props.eta_seconds = 90 * planned_variant_count
+        props.last_session_id = self._session.session_id
+        props.last_capture_method = method
+        # Speed policy (2.12): FAST/STANDARD skip remote vision audit; each mode
+        # still produces the provider-specific independent image variants.
+        auto_alignment_retry = bool(render_mode == "STRICT" and prefs.auto_alignment_retry)
+        alignment_threshold = int(prefs.alignment_threshold)
+        provider = _analysis_provider(props, prefs)
+        generate_fn = provider["generate"]
+        audit_fn = provider["audit"]
+        provider_cli_path = provider["cli_path"]
+        provider_model = provider["model"]
+        provider_id = provider["id"]
+        provider_label = provider["label"]
+        render_timeout = int(provider["render_timeout"])
+        audit_timeout = int(provider["audit_timeout"])
+        planned_attempts = max(1, int(prefs.alignment_max_attempts if auto_alignment_retry else 1))
+        self._provider_id = provider_id
+        self._provider_label = provider_label
+        timing_suffix = "strict" if auto_alignment_retry else ("fast" if render_mode == "FAST" else "standard")
+        variant_count = render_variant_count(provider_id)
+        self._variant_count = variant_count
+        self._completed_variants = Queue()
+        self._exported_by_variant = {}
+        self._exported_variant_records = {}
+        self._export_errors = []
+        # Store a separate total-duration bucket for each output count; otherwise
+        # a previous single-image average would be multiplied again after a
+        # multi-image run.
+        self._timing_key = f"{provider_id}_render_{timing_suffix}_x{self._variant_count}"
+        self._estimated_total = average_timing(
+            self._timing_key,
+            (180.0 if render_mode != "FAST" else 120.0) * self._variant_count,
+        )
+        edit_mask_path = str(structure.get("edit_mask_path", "")) if structure.get("enabled") else ""
+        masked_repair = bool(prefs.masked_alignment_repair and edit_mask_path)
+
+        def job():
+            attempts = []
+            variants = []
+            total_generation_seconds = 0.0
+            total_audit_seconds = 0.0
+            best_score = -1
+            best_path = None
+            best_audit = None
+            best_canvas = None
+            best_variant = None
+            best_rank = (False, -1)
+            for variant_index in range(1, variant_count + 1):
+                variant_attempts = []
+                variant_best_score = -1
+                variant_best_path = None
+                variant_best_audit = None
+                variant_best_canvas = None
+                variant_best_rank = (False, -1)
+                correction = ""
+                for attempt_index in range(1, planned_attempts + 1):
+                    candidate = self._session.directory / f"output_candidate_v{variant_index:02d}_a{attempt_index:02d}.png"
+                    attempt_prompt = render_prompt + (
+                        f"\n\n这是本轮{variant_count}张独立候选图中的第 {variant_index} 张。保持 Blender 规定的构图、几何、位置、尺度和视角不变；"
+                        "允许材质细节、反射、光影和环境氛围产生自然变化，避免机械复制其他候选图。"
+                    )
+                    if correction:
+                        attempt_prompt += (
+                            "\n\n上一轮构图未通过白模对齐校验。保持用户指定的外观和环境打光，"
+                            "按本轮提供的底图和修复范围恢复白模构图。具体纠偏：" + correction
+                        )
+
+                    edit_base, edit_mask = camera_base, ""
+                    repair_strategy = "WHITE_MODEL_REBASE" if correction else "WHITE_MODEL"
+                    region = None
+                    if correction and variant_attempts and masked_repair:
+                        previous = variant_attempts[-1]
+                        region = repair_region(structure, previous["audit"],
+                                               previous["canvas"].get("actual_size"),
+                                               (camera_w, camera_h), alignment_threshold)
+                        if region is not None:
+                            edit_base = previous["path"]
+                            edit_mask = write_repair_mask(
+                                self._session.directory / f"repair_mask_v{variant_index:02d}_a{attempt_index:02d}.png",
+                                previous["canvas"]["actual_size"], region,
+                            )
+                            repair_strategy = "UNION_MASK"
+                    if correction:
+                        attempt_prompt += (
+                            "\n本轮 Mask 同时覆盖偏移主体与目标位置；先清除旧位置残影，再在白模位置恢复主体。"
+                            if region is not None else
+                            "\n本轮重新使用原始白模整幅画布，不继承上一轮错误的比例、裁切或视角。"
+                        )
+                    generation_started = time.time()
+                    self._phase = f"生成第 {variant_index}/{variant_count} 张 · 尝试 {attempt_index}/{planned_attempts}"
+                    generation_references = references
+                    if provider_id == "antigravity" and edit_mask:
+                        # AGY accepts three ImagePaths total. A masked repair already
+                        # has edit_base + mask, so keep the authoritative camera only
+                        # and let the previous candidate carry the appearance state.
+                        generation_references = [camera_base]
+                    try:
+                        generation = generate_fn(
+                            prompt=attempt_prompt,
+                            reference_paths=generation_references,
+                            output_path=str(candidate),
+                            cwd=str(self._session.directory),
+                            explicit_path=provider_cli_path,
+                            model=provider_model,
+                            edit_base_path=edit_base,
+                            edit_mask_path=edit_mask,
+                            structure_control=structure if structure.get("enabled") else None,
+                            timeout=render_timeout,
+                        )
+                    except Exception:
+                        # If a later strict repair is rate-limited, the previous
+                        # candidate for this variant is still a completed output.
+                        if variant_best_path is not None and variant_best_path.is_file():
+                            self._completed_variants.put({
+                                "variant": variant_index,
+                                "best_path": str(variant_best_path),
+                                "best_score": variant_best_score,
+                                "best_audit": variant_best_audit,
+                                "best_canvas": variant_best_canvas,
+                                "attempts": list(variant_attempts),
+                                "partial": True,
+                            })
+                        raise
+                    generation_seconds = time.time() - generation_started
+                    total_generation_seconds += generation_seconds
+                    canvas = assess_canvas(image_dimensions(candidate), (camera_w, camera_h))
+
+                    audit = None
+                    score = -1
+                    audit_error = ""
+                    audit_seconds = 0.0
+                    if auto_alignment_retry:
+                        try:
+                            if canvas["matches"] or canvas.get("fit_compatible"):
+                                audit_started = time.time()
+                                self._phase = f"检查第 {variant_index}/{variant_count} 张构图"
+                                audit = audit_fn(
+                                    camera_reference=camera_base,
+                                    generated_image=str(candidate),
+                                    cwd=str(self._session.directory),
+                                    explicit_path=provider_cli_path,
+                                    model=provider_model,
+                                    tag=f"{variant_index}-{attempt_index}",
+                                    structure_control=structure if structure.get("enabled") else None,
+                                    structure_guide_path=str(structure.get("guide_path", "")) if structure.get("enabled") else "",
+                                    timeout=audit_timeout,
+                                )
+                                audit_seconds = time.time() - audit_started
+                                total_audit_seconds += audit_seconds
+                            else:
+                                audit = {"overall_score": 0, "passed": False, "source": "LOCAL_CANVAS_CHECK"}
+                            audit = assess_audit(audit, structure, canvas, alignment_threshold)
+                            score = int(audit.get("overall_score", -1))
+                        except Exception as exc:
+                            audit_error = str(exc)
+
+                    record = {
+                        "variant": variant_index,
+                        "attempt": attempt_index,
+                        "path": str(candidate),
+                        "score": score,
+                        "audit": audit,
+                        "audit_error": audit_error,
+                        "canvas": canvas,
+                        "repair_strategy": repair_strategy,
+                        "repair_region": region,
+                        "generation": generation,
+                        "generation_seconds": generation_seconds,
+                        "audit_seconds": (audit_seconds if auto_alignment_retry and audit is not None else 0.0),
+                    }
+                    attempts.append(record)
+                    variant_attempts.append(record)
+
+                    # A verified or aspect-fit-compatible canvas outranks an incompatible
+                    # canvas even if remote audit failed.
+                    rank = (bool(canvas["matches"] or canvas.get("fit_compatible")), score)
+                    if variant_best_path is None or rank > variant_best_rank:
+                        variant_best_path = candidate
+                        variant_best_score = score
+                        variant_best_audit = audit
+                        variant_best_canvas = canvas
+                        variant_best_rank = rank
+
+                    if not auto_alignment_retry:
+                        break
+                    if score < 0:
+                        # Audit unavailable: keep the good render rather than burning more image quota blindly.
+                        break
+                    if score >= alignment_threshold:
+                        break
+                    correction = (audit or {}).get("correction", "") or (
+                        "严格恢复 Reference 1 的车辆二维位置、尺度、轮心、相机高度、视角和地平线；不要重新构图。"
+                    )
+
+                if variant_best_path is None or not variant_best_path.exists():
+                    continue
+                variant = {
+                    "variant": variant_index,
+                    "best_path": str(variant_best_path),
+                    "best_score": variant_best_score,
+                    "best_audit": variant_best_audit,
+                    "best_canvas": variant_best_canvas,
+                    "attempts": variant_attempts,
+                }
+                variants.append(variant)
+                self._completed_variants.put(variant)
+                if best_path is None or variant_best_rank > best_rank:
+                    best_path = variant_best_path
+                    best_score = variant_best_score
+                    best_audit = variant_best_audit
+                    best_canvas = variant_best_canvas
+                    best_variant = variant_index
+                    best_rank = variant_best_rank
+
+            if len(variants) != variant_count or best_path is None or not best_path.exists():
+                raise RuntimeError(f"本轮只得到 {len(variants)} 张候选图，无法完成 {variant_count} 张生成。")
+            shutil.copy2(best_path, self._session.output_raw)
+            best_generation = None
+            if attempts:
+                best_generation = next((item.get("generation") for item in attempts if str(item.get("path")) == str(best_path)), None)
+            return {
+                "engine": (best_generation or {}).get("engine", f"{provider_id}_oauth_imagegen") if isinstance(best_generation, dict) else f"{provider_id}_oauth_imagegen",
+                "status": "ok",
+                "attempts": attempts,
+                "best_score": best_score,
+                "best_audit": best_audit,
+                "best_canvas": best_canvas,
+                "best_path": str(best_path),
+                "best_variant": best_variant,
+                "variants": variants,
+                "variant_count": variant_count,
+                "analysis_provider": provider_id,
+                "structure_control": structure,
+                "masked_repair": masked_repair,
+                "render_mode": render_mode,
+                "remote_audit_enabled": auto_alignment_retry,
+                "generation_seconds": total_generation_seconds,
+                "audit_seconds": total_audit_seconds,
+            }
+
+        if not self._start_thread(context, job):
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        props = self._origin_scene.wondful_ai
+        prefs = _addon_prefs(context)
+        if event.type == "TIMER":
+            # Finished variants are exported on the main thread while the next
+            # remote request is still running; a later 429 must not discard them.
+            self._drain_completed_variants(props)
+            if self._thread and self._thread.is_alive():
+                self._progress_update(props, 0.10, 0.88)
+                return {"RUNNING_MODAL"}
+
+            elapsed = time.time() - self._started_at
+            self._cleanup(context)
+            if self._error:
+                exc, _tb = self._error
+                if isinstance(exc, AntigravityNotLoggedInError):
+                    props.antigravity_account_state = "LOGGED_OUT"
+                    props.antigravity_account_message = str(exc)
+                elif isinstance(exc, AntigravityNotInstalledError):
+                    props.antigravity_account_state = "NOT_INSTALLED"
+                    props.antigravity_account_message = str(exc)
+                elif isinstance(exc, CodexNotLoggedInError):
+                    props.codex_account_state = "LOGGED_OUT"
+                    props.codex_account_message = str(exc)
+                elif isinstance(exc, CodexNotInstalledError):
+                    props.codex_account_state = "NOT_INSTALLED"
+                    props.codex_account_message = str(exc)
+                # Parameter/capacity/output failures do not establish an OAuth failure.
+                msg = safe_diagnostic(str(exc))
+                completed_count = len(getattr(self, "_exported_by_variant", {}))
+                expected_count = int(getattr(self, "_variant_count", RENDER_VARIANT_COUNT))
+                if completed_count:
+                    msg += f" 已完成并导出 {completed_count}/{expected_count} 张；其余结果未生成。"
+                if getattr(self, "_export_errors", None):
+                    msg += " 部分结果导出失败：" + "；".join(self._export_errors[:3])
+                _status(props, "ERROR", msg)
+                props.progress = 0.0
+                self.report({"ERROR"}, msg)
+                return {"CANCELLED"}
+
+            if getattr(self, "_provider_id", "codex") == "antigravity":
+                props.antigravity_account_state = "LOGGED_IN"
+            else:
+                props.codex_account_state = "LOGGED_IN"
+            result_data = self._result if isinstance(self._result, dict) else {}
+            attempts = result_data.get("attempts", [])
+            variants = result_data.get("variants", []) or []
+            expected_variant_count = max(
+                1,
+                min(RENDER_VARIANT_COUNT, int(getattr(self, "_variant_count", RENDER_VARIANT_COUNT))),
+            )
+            props.variant_count = max(
+                1,
+                min(expected_variant_count, int(result_data.get("variant_count", len(variants) or 1))),
+            )
+            props.alignment_attempts = len(attempts)
+            props.last_generation_seconds = float(result_data.get("generation_seconds", 0.0))
+            props.last_audit_seconds = float(result_data.get("audit_seconds", 0.0))
+            best_score = result_data.get("best_score", -1)
+            try:
+                props.alignment_score = float(best_score)
+            except Exception:
+                props.alignment_score = -1.0
+            best_audit = result_data.get("best_audit")
+            canvas = result_data.get("best_canvas") or {}
+            props.last_canvas_warning = str(canvas.get("message", ""))
+            props.last_canvas_fit = bool(canvas.get("fit_compatible") and not canvas.get("exact_size"))
+            if isinstance(best_audit, dict):
+                props.alignment_message = str(best_audit.get("correction", "")).strip()
+            elif bool(result_data.get("remote_audit_enabled", False)):
+                props.alignment_message = "构图校验未返回可解析评分；已保留生成结果。"
+            else:
+                props.alignment_message = "标准/快速模式未执行远程构图验收；可在 Wondful Compare 中人工检查，或切换严格对齐模式。"
+            props.progress = 0.94
+            camera_w, camera_h = self._camera_output_size
+            final_path, aspect_postprocessed = enforce_aspect_ratio(
+                str(self._session.output_raw),
+                str(self._session.output_final),
+                camera_w,
+                camera_h,
+            )
+            if image_dimensions(final_path) != (camera_w, camera_h):
+                props.last_canvas_fit = False
+            try:
+                output_dir = self._output_dir_at_start
+                if len(variants) != expected_variant_count:
+                    raise RuntimeError(f"本轮只得到 {len(variants)} 张候选图，无法完成 {expected_variant_count} 张导出。")
+                if self._export_errors:
+                    raise RuntimeError("；".join(self._export_errors[:3]))
+                exported_by_variant = dict(self._exported_by_variant)
+                if len(exported_by_variant) != expected_variant_count:
+                    raise RuntimeError(f"实际导出 {len(exported_by_variant)} 张，未达到要求的 {expected_variant_count} 张。")
+                exported_paths = [
+                    exported_by_variant[index]
+                    for index in sorted(exported_by_variant)
+                ]
+                best_variant = int(result_data.get("best_variant", 0) or 0)
+                exported = exported_by_variant.get(best_variant) or exported_paths[0]
+                props.last_export_path = str(exported)
+                props.last_export_paths = json.dumps([str(path) for path in exported_paths], ensure_ascii=False)
+            except Exception as exc:
+                _status(props, "ERROR", f"图片生成成功，但导出到输出目录失败: {exc}")
+                self.report({"ERROR"}, props.last_error)
+                return {"CANCELLED"}
+            try:
+                props.viewport_image = load_image(str(self._session.viewport_reference), "Wondful_Camera")
+                props.result_image = load_image(final_path, "Wondful_Result")
+                mask_path = str(self._structure.get("mask_path", ""))
+                props.structure_mask_image = load_image(mask_path, "Wondful_StructureMask") if mask_path and Path(mask_path).is_file() else None
+            except Exception as exc:
+                _status(props, "ERROR", f"图片生成成功，但 Blender 加载结果图失败: {exc}")
+                self.report({"ERROR"}, props.last_error)
+                return {"CANCELLED"}
+
+            props.last_viewport_path = str(self._session.viewport_reference)
+            props.last_result_path = str(exported)
+            props.progress = 1.0
+            props.eta_seconds = 0
+            props.last_total_seconds = time.perf_counter() - self._request_started_at
+            _status(props, "SUCCESS")
+            save_metadata(
+                self._session,
+                {
+                    "type": "ai_render",
+                    "prompt_profile": self._prompt_profile,
+                    "engine": result_data.get("engine", f"{getattr(self, '_provider_id', 'codex')}_oauth_imagegen"),
+                    "analysis_provider": result_data.get("analysis_provider", props.analysis_provider.lower()),
+                    "camera_reference_size": [self._width, self._height],
+                    "camera_output_size": list(self._camera_output_size),
+                    "camera_name": self._camera_name_at_start,
+                    "reference_counts": dict(self._reference_counts or {}),
+                    "reference_sources": self._reference_sources_at_start,
+                    "reference_instructions": self._reference_instructions_at_start,
+                    "style_fingerprint": str(getattr(self, "_style_fingerprint_at_render", "")),
+                    "target_generation_size": [self._target_w, self._target_h],
+                    "render_mode": getattr(self, "_render_mode", "STANDARD"),
+                    "effective_long_edge": int(getattr(self, "_effective_long_edge", prefs.long_edge)),
+                    "remote_audit_enabled": bool(result_data.get("remote_audit_enabled", False)),
+                    "generation_time": elapsed,
+                    "preparation_seconds": self._preparation_seconds,
+                    "total_seconds": props.last_total_seconds,
+                    "capture_method": props.last_capture_method,
+                    "aspect_postprocess_used": bool(aspect_postprocessed),
+                    "aspect_fit_applied": bool(aspect_postprocessed),
+                    "canvas_check": canvas,
+                    "structure_note": props.last_structure_note,
+                    "exported_result_path": str(exported),
+                    "exported_result_paths": [str(path) for path in exported_paths],
+                    "variant_count": props.variant_count,
+                    "output_directory": str(output_dir),
+                    "alignment_score": props.alignment_score,
+                    "alignment_attempts": props.alignment_attempts,
+                    "alignment_message": props.alignment_message,
+                    "alignment_threshold": int(prefs.alignment_threshold),
+                    "strict_composition_lock": bool(prefs.strict_composition_lock),
+                    "structure_control": result_data.get("structure_control", self._structure or {}),
+                    "masked_alignment_repair": bool(result_data.get("masked_repair", False)),
+                    "provider_response": self._result,
+                },
+            )
+            record_timing(getattr(self, "_timing_key", f"{getattr(self, '_provider_id', 'codex')}_render_standard"), elapsed)
+            score_text = f"，构图对齐 {props.alignment_score:.0f}/100" if props.alignment_score >= 0 else ""
+            if props.last_canvas_warning:
+                report_level = {"INFO"} if props.last_canvas_fit else {"WARNING"}
+                self.report(report_level, f"{props.last_canvas_warning} 已导出 {len(exported_paths)} 张；最佳结果：{exported}")
+            else:
+                self.report({"INFO"}, f"{getattr(self, '_provider_label', 'Codex')} AI渲染完成，总用时 {props.last_total_seconds:.1f}s{score_text}。已导出 {len(exported_paths)} 张；最佳结果：{exported}")
+            return {"FINISHED"}
+        return {"PASS_THROUGH"}
+
+
+class WONDFUL_OT_choose_output_directory(Operator):
+    bl_idname = "wondful.choose_output_directory"
+    bl_label = "选择渲染输出目录"
+    bl_description = "为当前 Blender 工程指定 Wondful AI 最终渲染图输出位置"
+
+    directory: StringProperty(name="输出目录", subtype="DIR_PATH", options={"SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        current = (props.output_directory or "").strip() or (prefs.output_directory or "").strip()
+        if current:
+            try:
+                self.directory = bpy.path.abspath(current)
+            except Exception:
+                self.directory = current
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        path = (self.directory or "").strip()
+        if not path:
+            self.report({"WARNING"}, "没有选择输出目录。")
+            return {"CANCELLED"}
+        context.scene.wondful_ai.output_directory = path
+        self.report({"INFO"}, f"当前工程输出目录：{path}")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_open_output_directory(Operator):
+    bl_idname = "wondful.open_output_directory"
+    bl_label = "打开输出目录"
+    bl_description = "打开当前 Wondful AI 渲染图输出目录"
+
+    def execute(self, context):
+        prefs = _addon_prefs(context)
+        props = context.scene.wondful_ai
+        try:
+            configured = (props.output_directory or "").strip() or (prefs.output_directory or "").strip()
+            directory = resolve_output_directory(context, configured)
+            bpy.ops.wm.path_open(filepath=str(directory))
+        except Exception as exc:
+            self.report({"ERROR"}, f"无法打开输出目录: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_load_reference(Operator, ImportHelper):
+    bl_idname = "wondful.load_reference"
+    bl_label = "添加参考图"
+    bl_description = "一次选择一张或多张图片添加到当前参考图集合；第一张为主参考"
+
+    filename_ext = ""
+    filter_glob: StringProperty(default="*.png;*.jpg;*.jpeg;*.webp", options={"HIDDEN"})
+    files: CollectionProperty(type=bpy.types.OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
+    directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN", "SKIP_SAVE"})
+    ref_kind: EnumProperty(
+        items=[
+            ("PRODUCT", "产品参考图", ""),
+            ("PERSON", "人物参考图", ""),
+            ("STYLE", "风格参考图", ""),
+        ]
+    )
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        collection, index_attr = _collection_and_index(props, self.ref_kind)
+        selected = []
+        if self.files:
+            selected = [str(Path(self.directory) / f.name) for f in self.files]
+        elif self.filepath:
+            selected = [self.filepath]
+        selected = [p for p in selected if p]
+        if not selected:
+            self.report({"WARNING"}, "没有选择参考图。")
+            return {"CANCELLED"}
+
+        # STYLE upload means "replace the current style set". In 2.17 this
+        # button appended new images behind the first upload, while the first
+        # image remained the hard-coded primary style forever.
+        if self.ref_kind == "STYLE":
+            added, failures = _replace_style_set(props, selected)
+            if len(selected) > MAX_REFERENCES_PER_KIND:
+                self.report({"WARNING"}, f"风格参考最多 {MAX_REFERENCES_PER_KIND} 张，多余图片未添加。")
+            elif failures:
+                self.report({"WARNING"}, f"风格已更换 {added} 张，{len(failures)} 张读取失败。")
+            elif added:
+                self.report({"INFO"}, f"已更换当前风格参考，共 {added} 张。")
+            return {"FINISHED" if added else "CANCELLED"}
+
+        capacity = MAX_REFERENCES_PER_KIND - len(collection)
+        if capacity <= 0:
+            self.report({"WARNING"}, f"每类参考图最多 {MAX_REFERENCES_PER_KIND} 张。")
+            return {"CANCELLED"}
+
+        added = 0
+        failures = []
+        for filepath in selected[:capacity]:
+            try:
+                _append_reference_from_path(props, self.ref_kind, filepath)
+                added += 1
+            except Exception as exc:
+                failures.append(f"{Path(filepath).name}: {exc}")
+        if added:
+            setattr(props, index_attr, len(collection) - 1)
+            _mark_reference_changed(props, self.ref_kind)
+        if len(selected) > capacity:
+            self.report({"WARNING"}, f"已达到每类 {MAX_REFERENCES_PER_KIND} 张上限，多余图片未添加。")
+        elif failures:
+            self.report({"WARNING"}, f"成功添加 {added} 张，{len(failures)} 张读取失败。")
+        else:
+            self.report({"INFO"}, f"已添加 {added} 张参考图。")
+        return {"FINISHED" if added else "CANCELLED"}
+
+
+class WONDFUL_OT_paste_reference(Operator):
+    bl_idname = "wondful.paste_reference"
+    bl_label = "粘贴参考图"
+    bl_description = "从系统图片剪贴板直接粘贴到当前参考图集合（macOS 支持截图/复制图片）"
+
+    ref_kind: EnumProperty(items=[("PRODUCT", "产品", ""), ("PERSON", "人物", ""), ("STYLE", "风格", "")])
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        collection, index_attr = _collection_and_index(props, self.ref_kind)
+        if self.ref_kind != "STYLE" and len(collection) >= MAX_REFERENCES_PER_KIND:
+            self.report({"WARNING"}, f"每类参考图最多 {MAX_REFERENCES_PER_KIND} 张。")
+            return {"CANCELLED"}
+        clipboard_dir = CONFIG_DIR / "clipboard"
+        clipboard_dir.mkdir(parents=True, exist_ok=True)
+        destination = clipboard_dir / f"clipboard_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
+        try:
+            path = save_clipboard_image(destination)
+            if self.ref_kind == "STYLE":
+                added, failures = _replace_style_set(props, [path])
+                if not added:
+                    raise RuntimeError(failures[0] if failures else "无法读取剪贴板风格图")
+            else:
+                _append_reference_from_path(props, self.ref_kind, path)
+                _mark_reference_changed(props, self.ref_kind)
+        except ClipboardImageError as exc:
+            self.report({"WARNING"}, str(exc))
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"粘贴参考图失败：{exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "已从剪贴板添加参考图。")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_replace_reference(Operator, ImportHelper):
+    bl_idname = "wondful.replace_reference"
+    bl_label = "替换参考图"
+
+    filename_ext = ""
+    filter_glob: StringProperty(default="*.png;*.jpg;*.jpeg;*.webp", options={"HIDDEN"})
+    ref_kind: EnumProperty(items=[("PRODUCT", "产品", ""), ("PERSON", "人物", ""), ("STYLE", "风格", "")])
+    item_index: IntProperty(default=-1, options={"HIDDEN", "SKIP_SAVE"})
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        collection, index_attr, idx = _resolve_reference_index(props, self.ref_kind, self.item_index)
+        if idx < 0:
+            return {"CANCELLED"}
+        try:
+            image = _load_reference_image(self.filepath)
+        except Exception as exc:
+            self.report({"ERROR"}, f"无法读取参考图: {exc}")
+            return {"CANCELLED"}
+        collection[idx].image = image
+        collection[idx].source_path = str(Path(self.filepath).expanduser())
+        _mark_reference_changed(props, self.ref_kind)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_clear_reference(Operator):
+    bl_idname = "wondful.clear_reference"
+    bl_label = "删除参考图"
+
+    ref_kind: EnumProperty(items=[("PRODUCT", "产品", ""), ("PERSON", "人物", ""), ("STYLE", "风格", "")])
+    item_index: IntProperty(default=-1, options={"HIDDEN", "SKIP_SAVE"})
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        collection, index_attr, idx = _resolve_reference_index(props, self.ref_kind, self.item_index)
+        if idx >= 0:
+            collection.remove(idx)
+            setattr(props, index_attr, max(0, min(idx, len(collection) - 1)))
+            _mark_reference_changed(props, self.ref_kind)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_clear_all_references(Operator):
+    bl_idname = "wondful.clear_all_references"
+    bl_label = "清空本类参考图"
+
+    ref_kind: EnumProperty(items=[("PRODUCT", "产品", ""), ("PERSON", "人物", ""), ("STYLE", "风格", "")])
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        collection, index_attr = _collection_and_index(props, self.ref_kind)
+        had_items = bool(collection)
+        collection.clear()
+        setattr(props, index_attr, 0)
+        if had_items:
+            _mark_reference_changed(props, self.ref_kind)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_move_reference(Operator):
+    bl_idname = "wondful.move_reference"
+    bl_label = "调整参考图顺序"
+
+    ref_kind: EnumProperty(items=[("PRODUCT", "产品", ""), ("PERSON", "人物", ""), ("STYLE", "风格", "")])
+    direction: EnumProperty(items=[("UP", "前移", ""), ("DOWN", "后移", "")])
+    item_index: IntProperty(default=-1, options={"HIDDEN", "SKIP_SAVE"})
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        collection, index_attr, idx = _resolve_reference_index(props, self.ref_kind, self.item_index)
+        if len(collection) < 2 or idx < 0:
+            return {"CANCELLED"}
+        target = idx - 1 if self.direction == "UP" else idx + 1
+        if target < 0 or target >= len(collection):
+            return {"CANCELLED"}
+        collection.move(idx, target)
+        setattr(props, index_attr, target)
+        _mark_reference_changed(props, self.ref_kind)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_open_prompt_text_editor(Operator):
+    bl_idname = "wondful.open_prompt_text_editor"
+    bl_label = "编辑完整提示词"
+    bl_description = "在当前区域展开完整文本；完成后点击顶部“返回渲染”，保留原视图"
+
+    def execute(self, context):
+        try:
+            open_prompt_in_area(context)
+        except Exception as exc:
+            self.report({"ERROR"}, f"无法展开提示词编辑器：{exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_close_prompt_text_editor(Operator):
+    bl_idname = "wondful.close_prompt_text_editor"
+    bl_label = "返回渲染"
+    bl_description = "同步完整提示词并恢复原来的编辑区域"
+
+    def execute(self, context):
+        if context.area and close_prompt_area(context.area):
+            return {"FINISHED"}
+        return {"CANCELLED"}
+
+
+class WONDFUL_OT_prompt_expand(Operator):
+    bl_idname = "wondful.prompt_expand"
+    bl_label = "展开多行编辑"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        from .properties import sync_prompt_editor
+        sync_prompt_editor(props, _get_prompt_text(props) or props.prompt or "")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_prompt_line_add(Operator):
+    bl_idname = "wondful.prompt_line_add"
+    bl_label = "添加提示词行"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        item = props.prompt_lines.add()
+        item.text = ""
+        props.prompt_line_index = len(props.prompt_lines) - 1
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_prompt_line_remove(Operator):
+    bl_idname = "wondful.prompt_line_remove"
+    bl_label = "删除提示词行"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        if props.prompt_lines:
+            idx = min(props.prompt_line_index, len(props.prompt_lines) - 1)
+            props.prompt_lines.remove(idx)
+            props.prompt_line_index = max(0, min(idx, len(props.prompt_lines) - 1))
+            _set_prompt_text(props, "\n".join(item.text.rstrip() for item in props.prompt_lines).strip())
+        return {"FINISHED"}

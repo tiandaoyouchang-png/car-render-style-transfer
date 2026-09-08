@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wondful Render Director"
+  short_description: "Model-adapted commercial appearance prompts with grounded references"
+  default_prompt: "Write a Wondful appearance prompt for the selected image provider using the current reference roles and creative brief."
