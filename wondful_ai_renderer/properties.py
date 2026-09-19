@@ -484,6 +484,50 @@ class WONDFUL_AISettings(PropertyGroup):
         default="",
         options={"SKIP_SAVE"},
     )
+    active_conversation_id: StringProperty(
+        name="当前会话 ID",
+        description="本次由当前 AI Provider 分配的远程会话 ID；可用于终端 agy -c 或客户端追溯",
+        default="",
+        options={"SKIP_SAVE"},
+    )
+    typesafe_auto_classify: BoolProperty(
+        name="TypeSafe 智能识别分类",
+        description="使用 TypeSafe 语义原语自动推断参考图角色（产品造型、环境风格或人物）",
+        default=True,
+    )
+    typesafe_aesthetic_theme: EnumProperty(
+        name="美学风格基调",
+        description="TypeSafe 参数化美学主题",
+        items=[
+            ("AUTO", "智能自动推荐", "由 TypeSafe 根据提示词与参考图自动分析判断"),
+            ("COMMERCIAL_STUDIO", "商业高级摄影棚拍", "大面积柔光箱，通透漫射与精密高光"),
+            ("CINEMATIC_DRAMATIC", "电影级戏剧光影", "强反差与侧逆光，深邃阴影与环境氛围"),
+            ("MINIMALIST_INDUSTRIAL", "极简现代工业", "自然漫射天光，克制中性色调与精密材质"),
+            ("CYBER_TECH", "赛博未来科技", "暗场发光，冷暖对撞与未来主义科技质感"),
+            ("NATURAL_LIFESTYLE", "真实户外与生活", "自然日光或黄金时刻，丰富环境反射"),
+        ],
+        default="AUTO",
+    )
+    typesafe_contrast_level: IntProperty(
+        name="光影反差等级",
+        description="1=全柔光漫射，3=标准商业光比，5=极端戏剧性强反差",
+        default=3,
+        min=1,
+        max=5,
+    )
+    typesafe_material_gloss: IntProperty(
+        name="材质高光等级",
+        description="1=完全哑光，3=半光泽微光，5=光学镜面/电镀铬",
+        default=3,
+        min=1,
+        max=5,
+    )
+    best_candidate_score: FloatProperty(
+        name="最优候选评分",
+        description="TypeSafe 对当前推荐预览图的综合质量评分（0-100）",
+        default=0.0,
+        options={"SKIP_SAVE"},
+    )
     last_capture_method: StringProperty(default="")
     last_canvas_warning: StringProperty(default="")
     last_canvas_fit: BoolProperty(

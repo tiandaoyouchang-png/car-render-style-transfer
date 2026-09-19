@@ -768,6 +768,7 @@ Reference 1 之后若存在 Structure Packet 图片，它们按 Mask / Depth / N
                         "engine": "antigravity_oauth_generate_image", "status": "ok",
                         "message": response, "source": str(candidate),
                         "tool_calls": len(tool_infos), "attached_images": len(staged_refs),
+                        "conversation_id": conversation_ids[-1] if conversation_ids else "",
                     }
                 except OSError:
                     continue

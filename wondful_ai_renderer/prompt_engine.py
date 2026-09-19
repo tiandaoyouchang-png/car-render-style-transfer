@@ -318,3 +318,25 @@ def select_polish_source(props, visible_prompt: str, style_refresh: bool) -> str
     if style_refresh and stored:
         return stored
     return visible or stored
+
+
+def enrich_prompt_with_typesafe(
+    canonical_prompt: str,
+    style_notes: list[str] | None = None,
+) -> tuple[str, dict]:
+    """Enrich an appearance prompt with TypeSafe parameters (theme, lighting, gloss, details)."""
+    from . import typesafe_engine
+    params = typesafe_engine.analyze_appearance_parameters(canonical_prompt, style_notes)
+    synthesized = params.get("synthesized_appearance", "")
+    base = sanitize_appearance_prompt(canonical_prompt)
+    if not base:
+        combined = synthesized
+    else:
+        # Append typed parameters to canonical prompt if not already present
+        if params["theme"].rationale not in base:
+            combined = f"{base}。{synthesized}"
+        else:
+            combined = base
+    sanitized = sanitize_appearance_prompt(combined)
+    return sanitized, params
+

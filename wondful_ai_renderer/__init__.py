@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Wondful AI 渲染器-测试版3.1.1 · Auth & Render Director",
+    "name": "Wondful AI 渲染器-测试版3.1.2 · Auth & Render Director & TypeSafe",
     "author": "Wondful AI",
-    "version": (3, 1, 1),
+    "version": (3, 1, 2),
     "blender": (4, 3, 0),
     "location": "3D Viewport > Sidebar > Wondful AI",
-    "description": "Deterministic Geometry → Structure Packet → Generative Appearance；Camera Base + Mask/Depth/Normal/Silhouette/Part-ID",
+    "description": "Deterministic Geometry → Structure Packet → Generative Appearance；Camera Base + Mask/Depth/Normal/Silhouette/Part-ID + TypeSafe Intelligence",
     "category": "Render",
 }
 
@@ -54,6 +54,9 @@ from .operators import (
     WONDFUL_OT_prompt_line_add,
     WONDFUL_OT_prompt_line_remove,
     WONDFUL_OT_replace_reference,
+    WONDFUL_OT_cancel_task,
+    WONDFUL_OT_auto_classify_references,
+    WONDFUL_OT_copy_conversation_id,
     reset_stale_task_status,
 )
 from .properties import WONDFUL_AISettings, WONDFUL_AddonPreferences, WONDFUL_PromptLine, WONDFUL_ReferenceItem, WONDFUL_ModelItem, sync_prompt_editor
@@ -82,6 +85,9 @@ CLASSES = (
     WONDFUL_OT_model_default,
     WONDFUL_OT_polish_prompt,
     WONDFUL_OT_ai_render,
+    WONDFUL_OT_cancel_task,
+    WONDFUL_OT_auto_classify_references,
+    WONDFUL_OT_copy_conversation_id,
     WONDFUL_OT_load_reference,
     WONDFUL_OT_choose_output_directory,
     WONDFUL_OT_open_output_directory,

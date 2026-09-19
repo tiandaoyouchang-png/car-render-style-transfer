@@ -59,6 +59,34 @@ def tty_command(cli: str, args: list[str], system: str | None = None):
     return [script, "-q", "-e", "-f", "-c", shlex.join([cli, *args]), "/dev/null"], True
 
 
+_ACTIVE_PROCESSES: set[ManagedProcess] = set()
+_PROCESSES_LOCK = threading.Lock()
+_CANCEL_EVENT = threading.Event()
+
+
+def is_cancellation_requested() -> bool:
+    return _CANCEL_EVENT.is_set()
+
+
+def request_cancellation() -> None:
+    _CANCEL_EVENT.set()
+    kill_active_processes()
+
+
+def reset_cancellation() -> None:
+    _CANCEL_EVENT.clear()
+
+
+def kill_active_processes() -> None:
+    with _PROCESSES_LOCK:
+        procs = list(_ACTIVE_PROCESSES)
+    for p in procs:
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+
 class ManagedProcess:
     """Own only this subprocess and its POSIX process group; drain output promptly."""
     def __init__(self, cli, args, *, cwd, env, use_tty=True):
@@ -68,6 +96,8 @@ class ManagedProcess:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
             start_new_session=(os.name != "nt"),
         )
+        with _PROCESSES_LOCK:
+            _ACTIVE_PROCESSES.add(self)
         self.output = queue.Queue()
         self._write_lock = threading.Lock()
         self._reader = threading.Thread(target=self._read, daemon=True, name="WondfulCLIOutput")
@@ -129,6 +159,8 @@ class ManagedProcess:
                     pass
 
     def close(self):
+        with _PROCESSES_LOCK:
+            _ACTIVE_PROCESSES.discard(self)
         self.stop()
         self._reader.join(timeout=1)
         for stream in (self.proc.stdin, self.proc.stdout):
@@ -146,11 +178,16 @@ def run_headless(cli, args, *, cwd, env, timeout):
     local interactive session and can launch a browser before Wondful can
     report the failure.  Interactive OAuth is owned by ``AuthSession`` instead.
     """
+    if is_cancellation_requested():
+        raise RuntimeError("任务已被用户主动取消。")
     process = ManagedProcess(cli, args, cwd=cwd, env=env, use_tty=False)
     start = time.monotonic()
     text = ""
     try:
         while True:
+            if is_cancellation_requested():
+                process.stop()
+                raise RuntimeError("任务已被用户主动取消。")
             text += process.read_available()
             started_agent = bool(re.search(r'"event"\s*:\s*"(?:init|result)"|"status"\s*:\s*"SUCCESS"', text))
             # AGY 1.1.x can briefly log "not logged in" before its asynchronous
@@ -168,3 +205,4 @@ def run_headless(cli, args, *, cwd, env, timeout):
             time.sleep(0.04)
     finally:
         process.close()
+

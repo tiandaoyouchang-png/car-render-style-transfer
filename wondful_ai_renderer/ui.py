@@ -352,6 +352,9 @@ class WONDFUL_PT_main(Panel):
         header = refs.row(align=True)
         opened = _disclosure(header, props, "ui_show_references", "参考图", icon="IMAGE_DATA", suffix=f"  {total}")
         if opened:
+            if total > 0 and not busy:
+                action_row = refs.row(align=True)
+                action_row.operator("wondful.auto_classify_references", text="TypeSafe 智能分类", icon="LIGHT")
             _draw_reference_group(refs, props, "产品造型", "product_images", "product_image_index", "PRODUCT", "ui_show_product_refs")
             _draw_reference_group(refs, props, "人物", "person_images", "person_image_index", "PERSON", "ui_show_person_refs")
             _draw_reference_group(refs, props, "环境／风格", "style_images", "style_image_index", "STYLE", "ui_show_style_refs")
@@ -373,6 +376,11 @@ class WONDFUL_PT_main(Panel):
             operator="wondful.polish_prompt",
             enabled=bool(not busy and state == "LOGGED_IN"),
         )
+
+        if busy:
+            cancel_row = layout.row(align=True)
+            cancel_row.scale_y = 1.2
+            cancel_row.operator("wondful.cancel_task", text="取消当前任务", icon="CANCEL")
 
         # ---- Render: follows references in actual operation order --------------
         render_box = layout.box()
@@ -467,6 +475,12 @@ class WONDFUL_PT_main(Panel):
                 result_box.label(text=f"本次已导出 {props.variant_count} 张独立结果；上方预览为最佳图", icon="IMAGE_DATA")
             if props.alignment_attempts:
                 result_box.label(text=f"生成尝试 {props.alignment_attempts} 次 · Session {props.last_session_id}", icon="INFO")
+            if getattr(props, "best_candidate_score", 0.0) > 0:
+                result_box.label(text=f"TypeSafe 优选评分：{props.best_candidate_score:.1f} / 100", icon="SOLO_ON")
+            if getattr(props, "active_conversation_id", ""):
+                conv_row = result_box.row(align=True)
+                conv_row.label(text=f"远程会话：{props.active_conversation_id[:18]}...", icon="WORLD")
+                conv_row.operator("wondful.copy_conversation_id", text="复制恢复命令", icon="COPYDOWN")
             if props.last_canvas_warning:
                 for line in wrap(props.last_canvas_warning, width=44):
                     result_box.label(text=line, icon="INFO" if getattr(props, "last_canvas_fit", False) else "ERROR")

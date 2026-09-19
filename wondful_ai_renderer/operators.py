@@ -73,6 +73,7 @@ def render_variant_count(provider_id: str) -> int:
 
 
 _ACTIVE_LOCK = threading.Lock()
+_ACTIVE_OPERATOR = None
 _AGY_AUTH = None
 _AGY_AUTH_OWNER = None
 _ASYNC_STATUSES = frozenset({"AUTHENTICATING", "REFRESHING_MODELS", "POLISHING", "RENDERING"})
@@ -380,6 +381,10 @@ class _BaseAsyncOperator(Operator):
         if not _ACTIVE_LOCK.acquire(blocking=False):
             self.report({"WARNING"}, "已有 AI / 登录任务正在运行。")
             return False
+        global _ACTIVE_OPERATOR
+        _ACTIVE_OPERATOR = self
+        from .cli_transport import reset_cancellation
+        reset_cancellation()
         self._owns_lock = True
         self._ownership_guard = threading.Lock()
         self._detached = threading.Event()
@@ -411,6 +416,13 @@ class _BaseAsyncOperator(Operator):
         return True
 
     def modal(self, context, event):
+        from .cli_transport import is_cancellation_requested
+        if is_cancellation_requested():
+            self._cleanup(context)
+            if self._origin_scene and self._origin_scene in list(bpy.data.scenes):
+                _status(self._origin_scene.wondful_ai, "IDLE", "任务已被取消")
+            self.report({"INFO"}, "任务已被取消")
+            return {"CANCELLED"}
         try:
             scene_exists = self._origin_scene in list(bpy.data.scenes)
         except ReferenceError:
@@ -441,7 +453,24 @@ class _BaseAsyncOperator(Operator):
                 self._owns_lock = False
                 _ACTIVE_LOCK.release()
 
+    def _request_cancel(self, context):
+        from .cli_transport import request_cancellation
+        request_cancellation()
+        self._cleanup(context)
+        self._release_lock()
+        try:
+            if self._origin_scene and self._origin_scene in list(bpy.data.scenes):
+                props = self._origin_scene.wondful_ai
+                _status(props, "IDLE", "任务已取消")
+                props.progress = 0.0
+                props.eta_seconds = 0
+        except Exception:
+            pass
+
     def _cleanup(self, context):
+        global _ACTIVE_OPERATOR
+        if _ACTIVE_OPERATOR is self:
+            _ACTIVE_OPERATOR = None
         if self._timer:
             try:
                 context.window_manager.event_timer_remove(self._timer)
@@ -771,6 +800,98 @@ class WONDFUL_OT_antigravity_auth_cancel(Operator):
     def execute(self, context):
         cancel_auth_session()
         context.window_manager.wondful_auth_code = ""
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_cancel_task(Operator):
+    bl_idname = "wondful.cancel_task"
+    bl_label = "取消当前任务"
+    bl_description = "主动中断正在执行的 AI 润色或生图任务，释放后台锁并恢复就绪状态"
+
+    def execute(self, context):
+        from .cli_transport import request_cancellation
+        request_cancellation()
+        cancel_auth_session(detach=True, context=context)
+        global _ACTIVE_OPERATOR
+        if _ACTIVE_OPERATOR is not None:
+            _ACTIVE_OPERATOR._request_cancel(context)
+        else:
+            props = getattr(getattr(context, "scene", None), "wondful_ai", None)
+            if props:
+                _status(props, "IDLE", "任务已取消")
+                props.progress = 0.0
+                props.eta_seconds = 0
+            if _ACTIVE_LOCK.locked():
+                try:
+                    _ACTIVE_LOCK.release()
+                except RuntimeError:
+                    pass
+        self.report({"INFO"}, "已取消当前任务。")
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_auto_classify_references(Operator):
+    bl_idname = "wondful.auto_classify_references"
+    bl_label = "TypeSafe 智能分类参考图"
+    bl_description = "基于 TypeSafe 语义分析自动整理参考图类别（产品造型、环境风格或人物）"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        from . import typesafe_engine
+        from .image_manager import image_filepath
+
+        all_refs = []
+        for kind in ("PRODUCT", "STYLE", "PERSON"):
+            coll, _ = _collection_and_index(props, kind)
+            for item in list(coll):
+                img = item.image
+                src = item.source_path or (image_filepath(img) if img else "")
+                note = (getattr(item, "instruction", "") or "").strip()
+                if src:
+                    all_refs.append((src, note, img))
+
+        if not all_refs:
+            self.report({"INFO"}, "当前没有参考图可分类。")
+            return {"CANCELLED"}
+
+        props.product_images.clear()
+        props.style_images.clear()
+        props.person_images.clear()
+
+        reclassified = {"PRODUCT": 0, "STYLE": 0, "PERSON": 0}
+        for src, note, img in all_refs:
+            judgment = typesafe_engine.classify_reference_intent(src, note)
+            target_kind = judgment.choice
+            coll, idx_attr = _collection_and_index(props, target_kind)
+            if len(coll) < MAX_REFERENCES_PER_KIND:
+                new_item = coll.add()
+                new_item.image = img
+                new_item.source_path = src
+                new_item.instruction = note
+                setattr(props, idx_attr, len(coll) - 1)
+                reclassified[target_kind] += 1
+
+        _mark_reference_changed(props, "STYLE")
+        msg = f"TypeSafe 智能分类完成：产品造型 {reclassified['PRODUCT']} 张，环境风格 {reclassified['STYLE']} 张，人物 {reclassified['PERSON']} 张。"
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class WONDFUL_OT_copy_conversation_id(Operator):
+    bl_idname = "wondful.copy_conversation_id"
+    bl_label = "复制会话 ID"
+    bl_description = "将当前 AI 会话 ID 及终端恢复命令复制到剪贴板"
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        cid = props.active_conversation_id.strip()
+        if not cid:
+            self.report({"WARNING"}, "当前尚无活跃的会话 ID。")
+            return {"CANCELLED"}
+        cmd = f"agy --conversation {cid}"
+        from .clipboard_utils import set_clipboard_text
+        set_clipboard_text(cmd)
+        self.report({"INFO"}, f"已复制终端恢复命令：{cmd}")
         return {"FINISHED"}
 
 
@@ -1688,8 +1809,30 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 ]
                 best_variant = int(result_data.get("best_variant", 0) or 0)
                 exported = exported_by_variant.get(best_variant) or exported_paths[0]
+                try:
+                    from . import typesafe_engine
+                    ranked = typesafe_engine.rank_candidates(
+                        [str(p) for p in exported_paths],
+                        str(self._session.viewport_reference),
+                        props.prompt,
+                    )
+                    if ranked:
+                        best_candidate_path, best_meta = ranked[0]
+                        exported = best_candidate_path
+                        props.best_candidate_score = float(best_meta.get("composite_score", 0.0))
+                except Exception:
+                    pass
                 props.last_export_path = str(exported)
                 props.last_export_paths = json.dumps([str(path) for path in exported_paths], ensure_ascii=False)
+                cid = result_data.get("conversation_id", "")
+                if not cid and attempts:
+                    for att in attempts:
+                        gen = att.get("generation") or {}
+                        if isinstance(gen, dict) and gen.get("conversation_id"):
+                            cid = gen["conversation_id"]
+                            break
+                if cid:
+                    props.active_conversation_id = str(cid)
             except Exception as exc:
                 _status(props, "ERROR", f"图片生成成功，但导出到输出目录失败: {exc}")
                 self.report({"ERROR"}, props.last_error)
