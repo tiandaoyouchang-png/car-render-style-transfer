@@ -62,6 +62,50 @@ def write_gray_png(path: str | Path, gray: np.ndarray) -> str:
     return str(target)
 
 
+def write_rgba_png(path: str | Path, rgba: np.ndarray) -> str:
+    """Write an 8-bit RGBA PNG without bpy/Pillow; safe on a worker thread."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(rgba, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise ValueError("Expected an HxWx4 RGBA array")
+    h, w, _ = arr.shape
+    raw = b"".join(b"\x00" + np.ascontiguousarray(arr[y]).tobytes() for y in range(h))
+    data = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+        + _png_chunk(b"IDAT", zlib.compress(raw, 9))
+        + _png_chunk(b"IEND", b"")
+    )
+    target.write_bytes(data)
+    return str(target)
+
+
+def write_identity_edit_mask(
+    path: str | Path,
+    identity_mask_npy: str | Path,
+    *,
+    editable_region: tuple[float, float, float, float] | None = None,
+) -> str:
+    """RGBA edit mask: alpha=0 editable, alpha=1 preserved; identity is always preserved."""
+    identity = np.load(str(identity_mask_npy), allow_pickle=False).astype(bool)
+    h, w = identity.shape
+    editable = np.ones((h, w), dtype=bool)
+    if editable_region is not None:
+        x0, y0, x1, y1 = [float(v) for v in editable_region]
+        x0 = max(0, min(w, int(np.floor(x0 * w))))
+        y0 = max(0, min(h, int(np.floor(y0 * h))))
+        x1 = max(0, min(w, int(np.ceil(x1 * w))))
+        y1 = max(0, min(h, int(np.ceil(y1 * h))))
+        editable[:, :] = False
+        if x1 > x0 and y1 > y0:
+            editable[y0:y1, x0:x1] = True
+    editable[identity] = False
+    rgba = np.full((h, w, 4), 255, dtype=np.uint8)
+    rgba[:, :, 3] = np.where(editable, 0, 255).astype(np.uint8)
+    return write_rgba_png(path, rgba)
+
+
 def build_identity_preserve_mask(
     part_index_path: str | Path,
     semantic_results: list[dict[str, Any]],
@@ -106,11 +150,14 @@ def build_identity_preserve_mask(
     mask = _dilate(mask, padding_px)
     gray = np.where(mask, 255, 0).astype(np.uint8)
     target = write_gray_png(output_path, gray)
+    mask_npy = str(Path(output_path).with_suffix(".npy"))
+    np.save(mask_npy, mask.astype(np.uint8), allow_pickle=False)
     yy, xx = np.nonzero(mask)
     h, w = mask.shape
     return {
         "enabled": True,
         "path": target,
+        "mask_npy_path": mask_npy,
         "indices": [int(x) for x in ids],
         "roles": sorted({role for _index, role in selected}),
         "padding_px": int(padding_px),
