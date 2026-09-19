@@ -1573,8 +1573,13 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                         and int(prefs.alignment_max_attempts) > 1) else 0
         try:
             references, bundle_note, self._reference_bundle = prepare_bundle(
-                [("camera", [camera_base]), ("structure", structure_refs),
-                 ("product", product_upload), ("person", person_upload), ("environment", style_upload)],
+                [
+                    ("camera", [camera_base]),
+                    ("structure", structure_refs, list(structure.get("generation_reference_roles", []))),
+                    ("product", product_upload),
+                    ("person", person_upload),
+                    ("environment", style_upload),
+                ],
                 self._session.directory, reserve=reserve, limit=reference_limit,
             )
             render_prompt += bundle_note
