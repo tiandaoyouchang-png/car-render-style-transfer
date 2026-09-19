@@ -35,10 +35,18 @@ def bundle_plan(groups, reserve=0, limit=MAX_IMAGE_PATHS):
     if slots < 3:
         raise ValueError("Not enough slots for camera, structure and appearance")
     numbered, index = [], 1
-    for role, paths in groups:
+    for group in groups:
+        if len(group) == 2:
+            role, paths = group
+            sub_roles = []
+        elif len(group) == 3:
+            role, paths, sub_roles = group
+        else:
+            raise ValueError("Each reference group must be (role, paths) or (role, paths, sub_roles)")
         members = []
-        for path in paths:
-            members.append({"reference": index, "role": role, "path": str(path)})
+        for member_index, path in enumerate(paths):
+            sub_role = str(sub_roles[member_index]) if member_index < len(sub_roles) else ""
+            members.append({"reference": index, "role": role, "sub_role": sub_role, "path": str(path)})
             index += 1
         if members:
             numbered.append({"role": role, "members": members})
@@ -130,7 +138,10 @@ def prepare_bundle(groups, directory, reserve=0, writer=write_sheet, limit=MAX_I
         else:
             path = writer(Path(directory)/f'reference_sheet_{i:02d}_{group["role"]}.png',members)
         paths.append(str(path))
-        mapping = ', '.join(f'R{m["reference"]} = {m["role"]}' for m in members)
+        mapping = ', '.join(
+            f'R{m["reference"]} = {m["role"]}' + (f'/{m.get("sub_role")}' if m.get("sub_role") else '')
+            for m in members
+        )
         lines.append(f'输入路径 {i}: {path}\n  格内标签：{mapping}。按从左到右、从上到下排列。')
         manifest.append({'path':str(path),'members':members})
     check_image_capacity(paths, limit - reserve)
