@@ -456,6 +456,7 @@ class WONDFUL_AISettings(PropertyGroup):
             ("IDLE", "Ready", "等待操作"),
             ("AUTHENTICATING", "Authenticating", "正在进行账号认证"),
             ("REFRESHING_MODELS", "Refreshing Models", "正在从当前 CLI 读取推理模型列表"),
+            ("CLASSIFYING", "Classifying References", "正在通过 Jev 整理参考图语义角色"),
             ("POLISHING", "Polishing Prompt", "正在分析 Blender 构图并润色提示词"),
             ("RENDERING", "Rendering", "正在通过当前 AI Provider 生成最终图片"),
             ("SUCCESS", "Success", "生成成功"),
