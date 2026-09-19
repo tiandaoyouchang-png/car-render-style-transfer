@@ -1089,6 +1089,20 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
 
         def job():
             final_user_text = user_text
+            # 3.1.3: Jev performs fast structured judgments about change scope,
+            # identity preservation and appearance parameters before the heavier
+            # provider polish. This does not replace Codex/AGY generation.
+            from . import jev_semantics
+            self._jev_appearance_meta = jev_semantics.analyze_appearance(
+                source_prompt,
+                list(ref_instructions.get("style", [])),
+            )
+            jev_synthesized = str(self._jev_appearance_meta.get("synthesized", "") or "").strip()
+            if jev_synthesized:
+                final_user_text += (
+                    "\n\n【Jev 结构化外观判断｜作为约束，不替代参考图】\n"
+                    + jev_synthesized
+                )
             self._style_summary = self._cached_style_summary
             if style_upload and not self._style_cache_hit:
                 self._phase = "分析当前风格 (1/2)"
@@ -1162,6 +1176,18 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
             else:
                 props.codex_account_state = "LOGGED_IN"
             polished = sanitize_appearance_prompt(self._result or "")
+            jev_meta = getattr(self, "_jev_appearance_meta", {}) or {}
+            props.jev_status = str(jev_meta.get("backend", "") or props.jev_status or "LOCAL_FALLBACK")
+            if jev_meta:
+                scope = (jev_meta.get("change_scope") or {}).get("choice", "")
+                theme = (jev_meta.get("theme") or {}).get("choice", "")
+                err = str(jev_meta.get("error", "") or "")
+                props.jev_status_message = (
+                    f"外观判断：{props.jev_status}"
+                    + (f" · {scope}" if scope else "")
+                    + (f" · {theme}" if theme else "")
+                    + (f" · 回退原因 {err[:80]}" if err else "")
+                )
             if not polished.strip():
                 _status(props, "ERROR", "AI 未返回有效外观提示词，已保留原内容。")
                 self.report({"ERROR"}, props.last_error)
