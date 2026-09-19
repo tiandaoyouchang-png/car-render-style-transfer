@@ -42,6 +42,10 @@ def _apply_macos_system_proxy(env):
 
 def runtime_env(cli_path=""):
     env = dict(os.environ)
+    # TypeSafe/Jev credentials belong to Wondful's in-process semantic client.
+    # Never expose them to Codex/AGY child processes or agent-accessible shells.
+    for secret_key in ("TYPESAFE_API_KEY", "TYPESAFE_BASE_URL", "TYPESAFE_DEFAULT_MODEL"):
+        env.pop(secret_key, None)
     # Finder-launched Blender may not inherit HOME even though Python can still
     # resolve Path.home() from the macOS account database.  AGY's Go runtime
     # requires the variable for its config, log and Keychain paths.
