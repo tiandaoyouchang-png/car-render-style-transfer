@@ -862,8 +862,12 @@ class WONDFUL_OT_auto_classify_references(Operator):
         uncertain = 0
         jev_count = 0
         fallback_count = 0
-        for current_kind, src, note, img in all_refs:
-            judgment = jev_semantics.classify_reference_intent(src, note, current_kind)
+        batch_input = [
+            {"filepath": src, "instruction": note, "current_kind": current_kind}
+            for current_kind, src, note, _img in all_refs
+        ]
+        judgments = jev_semantics.classify_references_batch(batch_input)
+        for (current_kind, src, note, img), judgment in zip(all_refs, judgments):
             target_kind = str(judgment.get("choice", "")).upper()
             confidence = float(judgment.get("confidence", 0.0) or 0.0)
             backend = str(judgment.get("backend", "LOCAL_FALLBACK"))
@@ -874,15 +878,20 @@ class WONDFUL_OT_auto_classify_references(Operator):
             if target_kind not in {"PRODUCT", "STYLE", "PERSON"} or confidence < jev_semantics.REFERENCE_CONFIDENCE_THRESHOLD:
                 target_kind = current_kind
                 uncertain += 1
-            staged.append((target_kind, src, note, img))
+            staged.append((current_kind, target_kind, src, note, img))
 
         props.product_images.clear()
         props.style_images.clear()
         props.person_images.clear()
 
         reclassified = {"PRODUCT": 0, "STYLE": 0, "PERSON": 0}
-        for target_kind, src, note, img in staged:
+        overflow_preserved = 0
+        for current_kind, target_kind, src, note, img in staged:
             coll, idx_attr = _collection_and_index(props, target_kind)
+            if len(coll) >= MAX_REFERENCES_PER_KIND and target_kind != current_kind:
+                target_kind = current_kind
+                coll, idx_attr = _collection_and_index(props, target_kind)
+                overflow_preserved += 1
             if len(coll) < MAX_REFERENCES_PER_KIND:
                 new_item = coll.add()
                 new_item.image = img
@@ -894,7 +903,7 @@ class WONDFUL_OT_auto_classify_references(Operator):
         _mark_reference_changed(props, "STYLE")
         props.jev_status = "JEV" if jev_count else "LOCAL_FALLBACK"
         props.jev_status_message = (
-            f"参考图分类：Jev {jev_count} · 本地回退 {fallback_count} · 保留原分类 {uncertain}"
+            f"参考图分类：Jev {jev_count} · 本地回退 {fallback_count} · 低置信保留 {uncertain} · 容量保留 {overflow_preserved}"
         )
         msg = (
             f"参考图分类完成：产品造型 {reclassified['PRODUCT']} 张，环境风格 {reclassified['STYLE']} 张，"
