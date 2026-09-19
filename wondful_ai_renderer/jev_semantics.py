@@ -251,6 +251,63 @@ def classify_reference_intent(filepath: str, instruction: str = "", current_kind
     return {"choice": choice, "confidence": confidence, "probabilities": {}, "backend": "LOCAL_FALLBACK", "error": error_text}
 
 
+def classify_references_batch(items: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """Classify multiple reference roles in one System One request.
+
+    Each item requires filepath/instruction/current_kind. Low-confidence policy is
+    intentionally left to the caller so the UI can preserve existing categories.
+    """
+    if not items:
+        return []
+    if _key():
+        state = {
+            "references": [
+                {
+                    "filename": Path(item.get("filepath", "")).name,
+                    "instruction": item.get("instruction", ""),
+                    "current_category": item.get("current_kind", ""),
+                }
+                for item in items
+            ]
+        }
+        questions = {}
+        for index in range(len(items)):
+            questions[f"role_{index}"] = {
+                "type": "choice",
+                "instructions": (
+                    f"Classify references[{index}] by intended rendering responsibility. "
+                    "Choose PRODUCT/STYLE/PERSON only with clear evidence; use MIXED for "
+                    "multiple equal roles and UNSURE for insufficient evidence."
+                ),
+                "criteria": REFERENCE_ROLES,
+            }
+        try:
+            data = _system_one(state, questions, timeout=12.0)
+            answers = data["answers"]
+            output = []
+            for index in range(len(items)):
+                row = _choice(answers.get(f"role_{index}", {}))
+                row.update({"backend": "JEV", "model": data.get("model", DEFAULT_MODEL), "error": ""})
+                output.append(row)
+            return output
+        except Exception as exc:
+            error_text = str(exc)
+    else:
+        error_text = ""
+
+    output = []
+    for item in items:
+        row = classify_reference_intent(
+            item.get("filepath", ""),
+            item.get("instruction", ""),
+            item.get("current_kind", ""),
+        )
+        if error_text and not row.get("error"):
+            row["error"] = error_text
+        output.append(row)
+    return output
+
+
 def analyze_appearance(brief: str, style_notes: list[str] | None = None) -> dict[str, Any]:
     state = {
         "creative_brief": brief or "",
