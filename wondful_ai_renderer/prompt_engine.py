@@ -324,19 +324,11 @@ def enrich_prompt_with_typesafe(
     canonical_prompt: str,
     style_notes: list[str] | None = None,
 ) -> tuple[str, dict]:
-    """Enrich an appearance prompt with TypeSafe parameters (theme, lighting, gloss, details)."""
-    from . import typesafe_engine
-    params = typesafe_engine.analyze_appearance_parameters(canonical_prompt, style_notes)
-    synthesized = params.get("synthesized_appearance", "")
+    """Compatibility entrypoint backed by real Jev semantics in 3.1.3."""
+    from . import jev_semantics
+    params = jev_semantics.analyze_appearance(canonical_prompt, style_notes)
+    synthesized = str(params.get("synthesized", "") or "").strip()
     base = sanitize_appearance_prompt(canonical_prompt)
-    if not base:
-        combined = synthesized
-    else:
-        # Append typed parameters to canonical prompt if not already present
-        if params["theme"].rationale not in base:
-            combined = f"{base}。{synthesized}"
-        else:
-            combined = base
-    sanitized = sanitize_appearance_prompt(combined)
-    return sanitized, params
+    combined = base if not synthesized or synthesized in base else (f"{base}。{synthesized}" if base else synthesized)
+    return sanitize_appearance_prompt(combined), params
 
