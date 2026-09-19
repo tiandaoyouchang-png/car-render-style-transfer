@@ -117,6 +117,15 @@ def _key() -> str:
     return os.environ.get(API_KEY_ENV, "").strip()
 
 
+def _raise_if_cancelled() -> None:
+    try:
+        from .cli_transport import is_cancellation_requested
+        if is_cancellation_requested():
+            raise JevError("TASK_CANCELLED")
+    except ImportError:
+        return
+
+
 def backend_status() -> dict[str, Any]:
     configured = bool(_key())
     model = os.environ.get(MODEL_ENV, DEFAULT_MODEL).strip() or DEFAULT_MODEL
@@ -147,14 +156,16 @@ def _system_one(state: Any, questions: dict[str, Any], timeout: float = 10.0) ->
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "wondful-ai-renderer/3.1.3",
+            "User-Agent": "wondful-ai-renderer/3.1.4",
         },
     )
     last = ""
     for attempt in range(2):
+        _raise_if_cancelled()
         try:
             with urlrequest.urlopen(req, timeout=max(1.0, float(timeout))) as response:
                 data = json.loads(response.read().decode("utf-8"))
+            _raise_if_cancelled()
             if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
                 raise JevError("Invalid TypeSafe response")
             answers = data["answers"]
@@ -184,11 +195,13 @@ def _system_one(state: Any, questions: dict[str, Any], timeout: float = 10.0) ->
             last = f"HTTP {exc.code}: {detail or exc.reason}"
             if exc.code not in {429, 500, 502, 503, 504} or attempt:
                 break
+            _raise_if_cancelled()
             time.sleep(0.35)
         except Exception as exc:
             last = f"{type(exc).__name__}: {exc}"
             if attempt:
                 break
+            _raise_if_cancelled()
             time.sleep(0.2)
     raise JevError(last or "TypeSafe request failed")
 
@@ -702,13 +715,18 @@ def resolve_object_semantics_batch(states: list[dict[str, Any]], batch_size: int
     return [row if row is not None else _local_object_semantics(states[index]) for index, row in enumerate(results)]
 
 
-def semantic_prompt_block(results: list[dict[str, Any]], part_manifest: dict[str, Any] | None = None) -> str:
+def semantic_prompt_block(
+    results: list[dict[str, Any]],
+    part_manifest: dict[str, Any] | None = None,
+    *,
+    preserve_identity: bool = True,
+) -> str:
     if not results:
         return ""
     manifest = part_manifest or {}
     has_jev = any(row.get("backend") == "JEV" for row in results)
     title = "TypeSafe/Jev Semantic Part Map" if has_jev else "Local Semantic Fallback Map"
-    critical = [row for row in results if row.get("identity_critical")]
+    critical = [row for row in results if preserve_identity and row.get("identity_critical")]
     confident = [row for row in results if float(row.get("part_confidence", 0.0)) >= SEMANTIC_CONFIDENCE_THRESHOLD]
     ordered = (critical + [row for row in confident if row not in critical])[:28]
     lines = []
@@ -718,7 +736,7 @@ def semantic_prompt_block(results: list[dict[str, Any]], part_manifest: dict[str
         rgb255 = []
         if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
             rgb255 = [max(0, min(255, int(round(float(value) * 255)))) for value in rgb[:3]]
-        marker = "IDENTITY_CRITICAL" if row.get("identity_critical") else ""
+        marker = "IDENTITY_CRITICAL" if preserve_identity and row.get("identity_critical") else ""
         internal_id = f"PART_{int(row.get('part_id_index') or 0):03d}" if row.get("part_id_index") else "PART_UNMAPPED"
         material_text = ""
         if float(row.get("material_confidence", 0.0)) >= MATERIAL_CONFIDENCE_THRESHOLD:
