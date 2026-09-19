@@ -237,6 +237,23 @@ class WONDFUL_AddonPreferences(AddonPreferences):
         description="局部偏移且位置估计可信时，修复范围覆盖当前位置与白模目标；比例或视角错误时回到原始白模重生成",
         default=True,
     )
+    identity_preserve_enabled: BoolProperty(
+        name="身份资产空间保护",
+        description="根据 Jev + Part Index 为 Logo、字标、车牌文字和可读 UI 生成 Preserve Mask，优先阻止生图模型改写这些区域",
+        default=True,
+    )
+    identity_preserve_padding: IntProperty(
+        name="身份保护扩边（像素）",
+        description="在身份资产可见像素周围增加少量保护边界，避免 Logo 边缘被生图模型侵蚀",
+        default=2,
+        min=0,
+        max=12,
+    )
+    identity_hard_restore: BoolProperty(
+        name="硬恢复身份像素（实验）",
+        description="最终导出前把 Camera Base 的身份区域像素精确回贴。仅当 Camera Base 已含正确 Logo/字标外观时启用；白模场景建议关闭",
+        default=False,
+    )
     auto_alignment_retry: BoolProperty(
         name="严格模式自动构图校验 / 重试",
         description="仅在主界面选择“严格对齐”时生效：生成后由当前 AI Provider 对比 Blender Camera Reference 与结果；未达阈值时自动带纠偏要求再生成一次",
@@ -291,6 +308,10 @@ class WONDFUL_AddonPreferences(AddonPreferences):
         col.prop(self, "strict_composition_lock")
         col.prop(self, "structure_guides_enabled")
         col.prop(self, "masked_alignment_repair")
+        col.prop(self, "identity_preserve_enabled")
+        if self.identity_preserve_enabled:
+            col.prop(self, "identity_preserve_padding")
+            col.prop(self, "identity_hard_restore")
         col.prop(self, "auto_alignment_retry")
         if self.auto_alignment_retry:
             col.prop(self, "alignment_threshold")
