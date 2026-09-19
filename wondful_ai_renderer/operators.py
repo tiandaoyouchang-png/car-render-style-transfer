@@ -1640,16 +1640,39 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
 
         def job():
             from . import jev_semantics
+            from .cli_transport import is_cancellation_requested
+            decision_meta = jev_semantics.analyze_appearance(
+                current_prompt,
+                list(ref_instructions.get("style", [])),
+            )
+            structural_probability = decision_meta.get("structural_change_probability")
+            if isinstance(structural_probability, (int, float)) and structural_probability >= 0.80:
+                scope = (decision_meta.get("change_scope") or {}).get("choice", "STRUCTURAL_CHANGE")
+                raise RuntimeError(
+                    f"检测到 {scope} 请求。请先在 Blender 中修改几何/相机/构图，再重新执行 AI 渲染；"
+                    "生图模型不会替代 Blender 结构修改。"
+                )
+            preserve_probability = decision_meta.get("preserve_identity_probability")
+            preserve_identity = not (
+                isinstance(preserve_probability, (int, float)) and preserve_probability <= 0.20
+            )
+            if is_cancellation_requested():
+                raise RuntimeError("任务已取消")
+
             semantic_results = jev_semantics.resolve_object_semantics_batch(
                 list(getattr(self, "_semantic_states", []))
             )
             semantic_block = jev_semantics.semantic_prompt_block(
                 semantic_results,
                 structure.get("part_id_manifest", {}) if structure.get("enabled") else {},
+                preserve_identity=preserve_identity,
             )
             effective_render_prompt = render_prompt + semantic_block
             semantic_meta = jev_semantics.semantic_summary(semantic_results)
-            from .cli_transport import is_cancellation_requested
+            semantic_meta["decision_backend"] = decision_meta.get("backend", "")
+            semantic_meta["preserve_identity"] = preserve_identity
+            semantic_meta["change_scope"] = (decision_meta.get("change_scope") or {}).get("choice", "")
+            semantic_meta["decision_usage"] = decision_meta.get("usage", {})
             if is_cancellation_requested():
                 raise RuntimeError("任务已取消")
 
