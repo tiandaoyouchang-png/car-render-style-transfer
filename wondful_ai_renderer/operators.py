@@ -2076,7 +2076,7 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 return {"CANCELLED"}
             try:
                 props.viewport_image = load_image(str(self._session.viewport_reference), "Wondful_Camera")
-                props.result_image = load_image(final_path, "Wondful_Result")
+                props.result_image = load_image(str(exported), "Wondful_Result")
                 mask_path = str(self._structure.get("mask_path", ""))
                 props.structure_mask_image = load_image(mask_path, "Wondful_StructureMask") if mask_path and Path(mask_path).is_file() else None
             except Exception as exc:
@@ -2127,6 +2127,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                     "strict_composition_lock": bool(prefs.strict_composition_lock),
                     "structure_control": result_data.get("structure_control", self._structure or {}),
                     "masked_alignment_repair": bool(result_data.get("masked_repair", False)),
+                    "identity_preserve_mask": result_data.get("identity_mask", {}),
+                    "identity_preserve_mask_path": result_data.get("identity_mask_path", ""),
+                    "identity_hard_restore": bool(result_data.get("identity_hard_restore", False)),
                     "provider_response": self._result,
                 },
             )
