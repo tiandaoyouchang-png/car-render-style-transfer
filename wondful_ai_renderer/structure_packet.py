@@ -182,7 +182,14 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
     if not product_objects:
         raise RuntimeError("EMPTY_PRODUCT_COLLECTION")
 
-    packet_w, packet_h = ((int(width), int(height)) if render_mode == "STRICT" else _packet_resolution(width, height))
+    # 3.1.5: Standard also renders native Object Index at the full camera grid.
+    # Small logos/wordmarks must not disappear in a lower-resolution Part-ID pass
+    # before the Identity Preserve Mask is derived. FAST keeps the bounded raster.
+    packet_w, packet_h = (
+        (int(width), int(height))
+        if render_mode in {"STRICT", "STANDARD"}
+        else _packet_resolution(width, height)
+    )
     raster_size = (packet_w, packet_h)
     temp_scene = bpy.data.scenes.new("Wondful_StructurePacket_" + uuid.uuid4().hex[:8])
     pass_index_snapshot: dict[str, tuple[bpy.types.Object, int]] = {}
