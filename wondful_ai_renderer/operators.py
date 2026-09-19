@@ -76,7 +76,7 @@ _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_OPERATOR = None
 _AGY_AUTH = None
 _AGY_AUTH_OWNER = None
-_ASYNC_STATUSES = frozenset({"AUTHENTICATING", "REFRESHING_MODELS", "POLISHING", "RENDERING"})
+_ASYNC_STATUSES = frozenset({"AUTHENTICATING", "REFRESHING_MODELS", "CLASSIFYING", "POLISHING", "RENDERING"})
 
 
 def cancel_auth_session(*, detach=False, context=None):
@@ -418,9 +418,22 @@ class _BaseAsyncOperator(Operator):
     def modal(self, context, event):
         from .cli_transport import is_cancellation_requested
         if is_cancellation_requested():
+            # Keep the modal and global lock alive until the worker actually exits.
+            # Jev HTTP cannot be force-killed like a CLI subprocess, so releasing
+            # the lock early would allow a second render to start concurrently.
+            if self._thread and self._thread.is_alive():
+                try:
+                    props = self._origin_scene.wondful_ai
+                    props.task_phase = "正在取消，等待当前网络/CLI请求结束"
+                    props.eta_seconds = 0
+                except (AttributeError, ReferenceError):
+                    pass
+                return {"RUNNING_MODAL"}
             self._cleanup(context)
             if self._origin_scene and self._origin_scene in list(bpy.data.scenes):
                 _status(self._origin_scene.wondful_ai, "IDLE", "任务已被取消")
+                self._origin_scene.wondful_ai.progress = 0.0
+                self._origin_scene.wondful_ai.eta_seconds = 0
             self.report({"INFO"}, "任务已被取消")
             return {"CANCELLED"}
         try:
@@ -456,13 +469,12 @@ class _BaseAsyncOperator(Operator):
     def _request_cancel(self, context):
         from .cli_transport import request_cancellation
         request_cancellation()
-        self._cleanup(context)
-        self._release_lock()
+        # Do not cleanup or release ownership here. The modal waits for the
+        # worker to exit, then performs one final cleanup/release.
         try:
             if self._origin_scene and self._origin_scene in list(bpy.data.scenes):
                 props = self._origin_scene.wondful_ai
-                _status(props, "IDLE", "任务已取消")
-                props.progress = 0.0
+                props.task_phase = "正在取消，等待当前请求结束"
                 props.eta_seconds = 0
         except Exception:
             pass
@@ -830,15 +842,15 @@ class WONDFUL_OT_cancel_task(Operator):
         return {"FINISHED"}
 
 
-class WONDFUL_OT_auto_classify_references(Operator):
+class WONDFUL_OT_auto_classify_references(_BaseAsyncOperator):
     bl_idname = "wondful.auto_classify_references"
-    bl_label = "TypeSafe 智能分类参考图"
-    bl_description = "基于 TypeSafe 语义分析自动整理参考图类别（产品造型、环境风格或人物）"
+    bl_label = "Jev 语义整理参考图"
+    bl_description = "根据文件名与用户备注进行 Jev 语义整理；Jev 不读取图片像素，低置信度保持原分类"
 
     def execute(self, context):
         props = context.scene.wondful_ai
-        from . import typesafe_engine
         from .image_manager import image_filepath
+        from . import jev_semantics
 
         all_refs = []
         for kind in ("PRODUCT", "STYLE", "PERSON"):
@@ -851,65 +863,120 @@ class WONDFUL_OT_auto_classify_references(Operator):
                     all_refs.append((kind, src, note, img))
 
         if not all_refs:
-            self.report({"INFO"}, "当前没有参考图可分类。")
+            self.report({"INFO"}, "当前没有参考图可整理。")
             return {"CANCELLED"}
 
-        # 3.1.3: classify first, mutate Blender collections only after every
-        # judgment has completed. A network failure can no longer leave a half-
-        # cleared reference set.
-        from . import jev_semantics
-        staged = []
-        uncertain = 0
-        jev_count = 0
-        fallback_count = 0
+        self._all_refs = all_refs
+        self._estimated_total = 12.0
         batch_input = [
             {"filepath": src, "instruction": note, "current_kind": current_kind}
             for current_kind, src, note, _img in all_refs
         ]
-        judgments = jev_semantics.classify_references_batch(batch_input)
-        for (current_kind, src, note, img), judgment in zip(all_refs, judgments):
+        _status(props, "CLASSIFYING")
+        props.progress = 0.05
+        props.eta_seconds = 12
+
+        if not self._start_thread(context, lambda: jev_semantics.classify_references_batch(batch_input)):
+            _status(props, "IDLE")
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        props = self._origin_scene.wondful_ai
+        if self._thread and self._thread.is_alive():
+            self._progress_update(props, 0.10, 0.85)
+            return {"RUNNING_MODAL"}
+
+        self._cleanup(context)
+        if self._error:
+            _status(props, "ERROR", safe_diagnostic(str(self._error[0])))
+            props.progress = 0.0
+            self.report({"ERROR"}, props.last_error)
+            return {"CANCELLED"}
+
+        from . import jev_semantics
+        judgments = list(self._result or [])
+        all_refs = list(getattr(self, "_all_refs", []))
+        if len(judgments) != len(all_refs):
+            _status(props, "ERROR", "Jev 返回数量与参考图数量不一致，已保留原分类。")
+            props.progress = 0.0
+            return {"CANCELLED"}
+
+        uncertain = 0
+        jev_count = 0
+        fallback_count = 0
+        staged = []
+        counts = {"PRODUCT": 0, "STYLE": 0, "PERSON": 0}
+        for current_kind, _src, _note, _img in all_refs:
+            counts[current_kind] += 1
+
+        migration_candidates = []
+        for idx, ((current_kind, src, note, img), judgment) in enumerate(zip(all_refs, judgments)):
             target_kind = str(judgment.get("choice", "")).upper()
             confidence = float(judgment.get("confidence", 0.0) or 0.0)
             backend = str(judgment.get("backend", "LOCAL_FALLBACK"))
-            if backend == "JEV":
-                jev_count += 1
-            else:
-                fallback_count += 1
+            jev_count += int(backend == "JEV")
+            fallback_count += int(backend != "JEV")
             if target_kind not in {"PRODUCT", "STYLE", "PERSON"} or confidence < jev_semantics.REFERENCE_CONFIDENCE_THRESHOLD:
                 target_kind = current_kind
                 uncertain += 1
-            staged.append((current_kind, target_kind, src, note, img))
+            staged.append([current_kind, current_kind, src, note, img, confidence])
+            if target_kind != current_kind:
+                migration_candidates.append((confidence, idx, target_kind))
+
+        # Original membership is reserved first. Migrations are then accepted
+        # highest-confidence first only when the destination has free capacity.
+        migrated = 0
+        capacity_preserved = 0
+        for _confidence, idx, target_kind in sorted(migration_candidates, reverse=True):
+            current_kind = staged[idx][0]
+            if counts[target_kind] >= MAX_REFERENCES_PER_KIND:
+                capacity_preserved += 1
+                continue
+            counts[current_kind] -= 1
+            counts[target_kind] += 1
+            staged[idx][1] = target_kind
+            migrated += 1
+
+        if sum(counts.values()) != len(all_refs) or any(v > MAX_REFERENCES_PER_KIND for v in counts.values()):
+            _status(props, "ERROR", "参考图容量校验失败，已保留原分类。")
+            props.progress = 0.0
+            return {"CANCELLED"}
+
+        style_changed = any(current != target and (current == "STYLE" or target == "STYLE")
+                            for current, target, *_rest in staged)
 
         props.product_images.clear()
         props.style_images.clear()
         props.person_images.clear()
-
-        reclassified = {"PRODUCT": 0, "STYLE": 0, "PERSON": 0}
-        overflow_preserved = 0
-        for current_kind, target_kind, src, note, img in staged:
+        restored = 0
+        for _current, target_kind, src, note, img, _confidence in staged:
             coll, idx_attr = _collection_and_index(props, target_kind)
-            if len(coll) >= MAX_REFERENCES_PER_KIND and target_kind != current_kind:
-                target_kind = current_kind
-                coll, idx_attr = _collection_and_index(props, target_kind)
-                overflow_preserved += 1
-            if len(coll) < MAX_REFERENCES_PER_KIND:
-                new_item = coll.add()
-                new_item.image = img
-                new_item.source_path = src
-                new_item.instruction = note
-                setattr(props, idx_attr, len(coll) - 1)
-                reclassified[target_kind] += 1
+            new_item = coll.add()
+            new_item.image = img
+            new_item.source_path = src
+            new_item.instruction = note
+            setattr(props, idx_attr, len(coll) - 1)
+            restored += 1
 
-        _mark_reference_changed(props, "STYLE")
-        props.jev_status = "JEV" if jev_count else "LOCAL_FALLBACK"
+        if restored != len(all_refs):
+            _status(props, "ERROR", "参考图恢复数量异常。")
+            props.progress = 0.0
+            return {"CANCELLED"}
+        if style_changed:
+            _mark_reference_changed(props, "STYLE")
+
+        props.jev_status = "JEV" if jev_count and not fallback_count else ("MIXED" if jev_count else "LOCAL_FALLBACK")
         props.jev_status_message = (
-            f"参考图分类：Jev {jev_count} · 本地回退 {fallback_count} · 低置信保留 {uncertain} · 容量保留 {overflow_preserved}"
+            f"语义整理：Jev {jev_count} · 本地回退 {fallback_count} · 迁移 {migrated} · "
+            f"低置信保留 {uncertain} · 容量保留 {capacity_preserved}"
         )
-        msg = (
-            f"参考图分类完成：产品造型 {reclassified['PRODUCT']} 张，环境风格 {reclassified['STYLE']} 张，"
-            f"人物 {reclassified['PERSON']} 张；低置信度 {uncertain} 张已保留原分类。"
-        )
-        self.report({"INFO"}, msg)
+        props.progress = 1.0
+        props.eta_seconds = 0
+        _status(props, "IDLE")
+        self.report({"INFO"}, props.jev_status_message)
         return {"FINISHED"}
 
 
@@ -1582,6 +1649,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
             )
             effective_render_prompt = render_prompt + semantic_block
             semantic_meta = jev_semantics.semantic_summary(semantic_results)
+            from .cli_transport import is_cancellation_requested
+            if is_cancellation_requested():
+                raise RuntimeError("任务已取消")
 
             attempts = []
             variants = []
@@ -1785,7 +1855,10 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 "generation_seconds": total_generation_seconds,
                 "audit_seconds": total_audit_seconds,
                 "semantic_summary": semantic_meta,
-                "semantic_backend": ("JEV" if semantic_meta.get("backends", {}).get("JEV", 0) else "LOCAL_FALLBACK"),
+                "semantic_backend": (
+                    "MIXED" if semantic_meta.get("backends", {}).get("JEV", 0) and semantic_meta.get("backends", {}).get("LOCAL_FALLBACK", 0)
+                    else ("JEV" if semantic_meta.get("backends", {}).get("JEV", 0) else "LOCAL_FALLBACK")
+                ),
             }
 
         if not self._start_thread(context, job):
