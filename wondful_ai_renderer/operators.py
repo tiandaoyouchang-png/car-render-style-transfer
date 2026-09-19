@@ -829,16 +829,19 @@ class WONDFUL_OT_cancel_task(Operator):
             _ACTIVE_OPERATOR._request_cancel(context)
         else:
             props = getattr(getattr(context, "scene", None), "wondful_ai", None)
+            if _ACTIVE_LOCK.locked():
+                # The lock is owned by a detached worker. Never release a lock
+                # without its owner; wait for that worker's finally block.
+                if props:
+                    props.task_phase = "后台任务正在结束"
+                    props.eta_seconds = 0
+                self.report({"INFO"}, "后台任务正在结束，完成后会自动释放。")
+                return {"FINISHED"}
             if props:
-                _status(props, "IDLE", "任务已取消")
+                _status(props, "IDLE", "当前没有可取消的任务")
                 props.progress = 0.0
                 props.eta_seconds = 0
-            if _ACTIVE_LOCK.locked():
-                try:
-                    _ACTIVE_LOCK.release()
-                except RuntimeError:
-                    pass
-        self.report({"INFO"}, "已取消当前任务。")
+        self.report({"INFO"}, "已发送取消请求。")
         return {"FINISHED"}
 
 
