@@ -43,7 +43,7 @@ from .structure_control import (
 )
 
 
-PACKET_VERSION = "3.0.9"
+PACKET_VERSION = "3.0.10"
 _NATIVE_MAX_EDGE = 1536
 
 
@@ -440,7 +440,10 @@ def _select_generation_refs(packet: dict, mode: str) -> tuple[list[str], list[st
     elif mode == "STRICT":
         wanted = {"product_mask", "scene_depth", "scene_normal", "product_silhouette", "part_id"}
     else:
-        wanted = {"product_mask", "scene_depth", "scene_normal", "product_silhouette"}
+        # Standard keeps Part-ID because semantic part/material constraints need
+        # a spatial carrier. Normal is less valuable than Part-ID for automotive
+        # appearance transfer under limited reference slots.
+        wanted = {"product_mask", "scene_depth", "product_silhouette", "part_id"}
     refs: list[str] = []
     roles: list[str] = []
     descriptions: list[str] = []
