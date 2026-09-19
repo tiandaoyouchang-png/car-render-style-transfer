@@ -427,9 +427,7 @@ def generate_image(
         packet_roles = list(structure_control.get("generation_reference_roles", []))
         packet_version = structure_control.get("packet_version", "2.x")
         native_passes = bool(structure_control.get("native_passes", False))
-        role_lines = []
-        for ref_index, role in enumerate(packet_roles, start=2):
-            role_lines.append(f"- Reference {ref_index}: Blender Structure Packet / {role}")
+        role_lines = [f"- Structure source role: {role}" for role in packet_roles]
         structure_note = f"""
 Blender Structure Lock {packet_version}：
 - Camera Base 是唯一整张画面的 Camera / Composition / Perspective 权威。
