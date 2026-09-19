@@ -1,7 +1,10 @@
 import importlib.util
 import os
 from pathlib import Path
+import tempfile
 import unittest
+
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +20,7 @@ def load_module(name, relative):
 
 jev = load_module("wondful_jev_semantics_test", "wondful_ai_renderer/jev_semantics.py")
 runtime = load_module("wondful_cli_runtime_test", "wondful_ai_renderer/cli_runtime.py")
+identity = load_module("wondful_identity_preserve_test", "wondful_ai_renderer/identity_preserve.py")
 
 
 class JevSemanticTests(unittest.TestCase):
@@ -88,6 +92,53 @@ class JevSemanticTests(unittest.TestCase):
         os.environ["TYPESAFE_DEFAULT_MODEL"] = "jev-b"
         second = jev._cache_key(state)
         self.assertNotEqual(first, second)
+
+
+class IdentityPreserveTests(unittest.TestCase):
+    def test_build_mask_selects_only_identity_part_ids_and_pads(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            index_map = np.zeros((8, 10), dtype=np.int32)
+            index_map[3:5, 4:6] = 7
+            index_map[1:3, 1:3] = 2
+            np.save(root / "parts.npy", index_map, allow_pickle=False)
+            rows = [
+                {"identity_critical": True, "part_id_index": 7, "part_class": "LOGO_BADGE"},
+                {"identity_critical": False, "part_id_index": 2, "part_class": "WHEEL"},
+            ]
+            result = identity.build_identity_preserve_mask(
+                root / "parts.npy", rows, root / "identity.png", padding_px=1
+            )
+            self.assertTrue(result["enabled"])
+            self.assertEqual(result["indices"], [7])
+            mask = np.load(result["mask_npy_path"], allow_pickle=False)
+            self.assertEqual(mask.shape, index_map.shape)
+            self.assertEqual(int(mask[3, 4]), 1)
+            self.assertEqual(int(mask[2, 3]), 1)
+            self.assertEqual(int(mask[1, 1]), 0)
+            self.assertTrue((root / "identity.png").is_file())
+
+    def test_edit_mask_writes_valid_png(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mask = np.zeros((4, 5), dtype=np.uint8)
+            mask[1, 2] = 1
+            np.save(root / "identity.npy", mask, allow_pickle=False)
+            output = identity.write_identity_edit_mask(root / "edit.png", root / "identity.npy")
+            self.assertTrue(Path(output).is_file())
+            self.assertEqual(Path(output).read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_no_identity_parts_disables_mask(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            np.save(root / "parts.npy", np.zeros((4, 4), dtype=np.int32), allow_pickle=False)
+            result = identity.build_identity_preserve_mask(
+                root / "parts.npy",
+                [{"identity_critical": False, "part_id_index": 1, "part_class": "BODY_PANEL"}],
+                root / "identity.png",
+            )
+            self.assertFalse(result["enabled"])
+            self.assertEqual(result["reason"], "NO_IDENTITY_PARTS")
 
 
 class RuntimeSecretTests(unittest.TestCase):
