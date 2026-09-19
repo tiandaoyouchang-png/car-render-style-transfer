@@ -848,21 +848,50 @@ class WONDFUL_OT_auto_classify_references(Operator):
                 src = item.source_path or (image_filepath(img) if img else "")
                 note = (getattr(item, "instruction", "") or "").strip()
                 if src:
-                    all_refs.append((src, note, img))
+                    all_refs.append((kind, src, note, img))
 
         if not all_refs:
             self.report({"INFO"}, "当前没有参考图可分类。")
             return {"CANCELLED"}
+
+        # 3.1.3: classify first, mutate Blender collections only after every
+        # judgment has completed. A network failure can no longer leave a half-
+        # cleared reference set.
+        from . import jev_semantics
+        staged = []
+        uncertain = 0
+        jev_count = 0
+        fallback_count = 0
+        batch_input = [
+            {"filepath": src, "instruction": note, "current_kind": current_kind}
+            for current_kind, src, note, _img in all_refs
+        ]
+        judgments = jev_semantics.classify_references_batch(batch_input)
+        for (current_kind, src, note, img), judgment in zip(all_refs, judgments):
+            target_kind = str(judgment.get("choice", "")).upper()
+            confidence = float(judgment.get("confidence", 0.0) or 0.0)
+            backend = str(judgment.get("backend", "LOCAL_FALLBACK"))
+            if backend == "JEV":
+                jev_count += 1
+            else:
+                fallback_count += 1
+            if target_kind not in {"PRODUCT", "STYLE", "PERSON"} or confidence < jev_semantics.REFERENCE_CONFIDENCE_THRESHOLD:
+                target_kind = current_kind
+                uncertain += 1
+            staged.append((current_kind, target_kind, src, note, img))
 
         props.product_images.clear()
         props.style_images.clear()
         props.person_images.clear()
 
         reclassified = {"PRODUCT": 0, "STYLE": 0, "PERSON": 0}
-        for src, note, img in all_refs:
-            judgment = typesafe_engine.classify_reference_intent(src, note)
-            target_kind = judgment.choice
+        overflow_preserved = 0
+        for current_kind, target_kind, src, note, img in staged:
             coll, idx_attr = _collection_and_index(props, target_kind)
+            if len(coll) >= MAX_REFERENCES_PER_KIND and target_kind != current_kind:
+                target_kind = current_kind
+                coll, idx_attr = _collection_and_index(props, target_kind)
+                overflow_preserved += 1
             if len(coll) < MAX_REFERENCES_PER_KIND:
                 new_item = coll.add()
                 new_item.image = img
@@ -872,7 +901,14 @@ class WONDFUL_OT_auto_classify_references(Operator):
                 reclassified[target_kind] += 1
 
         _mark_reference_changed(props, "STYLE")
-        msg = f"TypeSafe 智能分类完成：产品造型 {reclassified['PRODUCT']} 张，环境风格 {reclassified['STYLE']} 张，人物 {reclassified['PERSON']} 张。"
+        props.jev_status = "JEV" if jev_count else "LOCAL_FALLBACK"
+        props.jev_status_message = (
+            f"参考图分类：Jev {jev_count} · 本地回退 {fallback_count} · 低置信保留 {uncertain} · 容量保留 {overflow_preserved}"
+        )
+        msg = (
+            f"参考图分类完成：产品造型 {reclassified['PRODUCT']} 张，环境风格 {reclassified['STYLE']} 张，"
+            f"人物 {reclassified['PERSON']} 张；低置信度 {uncertain} 张已保留原分类。"
+        )
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
@@ -941,7 +977,7 @@ class WONDFUL_OT_copy_diagnostics(Operator):
         props, prefs = context.scene.wondful_ai, _addon_prefs(context)
         provider = _analysis_provider(props, prefs)
         data = {
-            "addon": "3.1.1", "platform": platform.platform(),
+            "addon": "3.1.3", "platform": platform.platform(),
             "blender": getattr(bpy.app, "version_string", "unknown"),
             "provider": provider["id"], "cli_path": provider["discover"]() or provider["cli_path"],
             "addon_path": str(Path(__file__).resolve().parent),
@@ -1062,6 +1098,20 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
 
         def job():
             final_user_text = user_text
+            # 3.1.3: Jev performs fast structured judgments about change scope,
+            # identity preservation and appearance parameters before the heavier
+            # provider polish. This does not replace Codex/AGY generation.
+            from . import jev_semantics
+            self._jev_appearance_meta = jev_semantics.analyze_appearance(
+                source_prompt,
+                list(ref_instructions.get("style", [])),
+            )
+            jev_synthesized = str(self._jev_appearance_meta.get("synthesized", "") or "").strip()
+            if jev_synthesized:
+                final_user_text += (
+                    "\n\n【Jev 结构化外观判断｜作为约束，不替代参考图】\n"
+                    + jev_synthesized
+                )
             self._style_summary = self._cached_style_summary
             if style_upload and not self._style_cache_hit:
                 self._phase = "分析当前风格 (1/2)"
@@ -1135,6 +1185,18 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
             else:
                 props.codex_account_state = "LOGGED_IN"
             polished = sanitize_appearance_prompt(self._result or "")
+            jev_meta = getattr(self, "_jev_appearance_meta", {}) or {}
+            props.jev_status = str(jev_meta.get("backend", "") or props.jev_status or "LOCAL_FALLBACK")
+            if jev_meta:
+                scope = (jev_meta.get("change_scope") or {}).get("choice", "")
+                theme = (jev_meta.get("theme") or {}).get("choice", "")
+                err = str(jev_meta.get("error", "") or "")
+                props.jev_status_message = (
+                    f"外观判断：{props.jev_status}"
+                    + (f" · {scope}" if scope else "")
+                    + (f" · {theme}" if theme else "")
+                    + (f" · 回退原因 {err[:80]}" if err else "")
+                )
             if not polished.strip():
                 _status(props, "ERROR", "AI 未返回有效外观提示词，已保留原内容。")
                 self.report({"ERROR"}, props.last_error)
@@ -1399,6 +1461,12 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 self.report({"ERROR"}, f"产品集合无法生成 Structure Packet：{reason}。请确认集合中有当前相机可见的 Mesh。")
                 return {"CANCELLED"}
         self._structure = structure
+        # Collect Blender state on the main thread. The worker may call Jev using
+        # this JSON-safe snapshot without touching bpy from a background thread.
+        from . import jev_semantics
+        self._semantic_states = jev_semantics.collect_product_object_states(
+            context, props, structure.get("part_id_manifest", {}) if structure.get("enabled") else {}
+        )
         props.last_structure_note = (
             "结构图：原生相机数据，已统一白模画布。" if structure.get("native_passes") else
             "结构图已降级为投影近似；遮挡和深度需人工检查。" if structure.get("enabled") else
@@ -1504,6 +1572,17 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
         masked_repair = bool(prefs.masked_alignment_repair and edit_mask_path)
 
         def job():
+            from . import jev_semantics
+            semantic_results = jev_semantics.resolve_object_semantics_batch(
+                list(getattr(self, "_semantic_states", []))
+            )
+            semantic_block = jev_semantics.semantic_prompt_block(
+                semantic_results,
+                structure.get("part_id_manifest", {}) if structure.get("enabled") else {},
+            )
+            effective_render_prompt = render_prompt + semantic_block
+            semantic_meta = jev_semantics.semantic_summary(semantic_results)
+
             attempts = []
             variants = []
             total_generation_seconds = 0.0
@@ -1524,7 +1603,7 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 correction = ""
                 for attempt_index in range(1, planned_attempts + 1):
                     candidate = self._session.directory / f"output_candidate_v{variant_index:02d}_a{attempt_index:02d}.png"
-                    attempt_prompt = render_prompt + (
+                    attempt_prompt = effective_render_prompt + (
                         f"\n\n这是本轮{variant_count}张独立候选图中的第 {variant_index} 张。保持 Blender 规定的构图、几何、位置、尺度和视角不变；"
                         "允许材质细节、反射、光影和环境氛围产生自然变化，避免机械复制其他候选图。"
                     )
@@ -1705,6 +1784,8 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 "remote_audit_enabled": auto_alignment_retry,
                 "generation_seconds": total_generation_seconds,
                 "audit_seconds": total_audit_seconds,
+                "semantic_summary": semantic_meta,
+                "semantic_backend": ("JEV" if semantic_meta.get("backends", {}).get("JEV", 0) else "LOCAL_FALLBACK"),
             }
 
         if not self._start_thread(context, job):
@@ -1769,6 +1850,14 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
             props.alignment_attempts = len(attempts)
             props.last_generation_seconds = float(result_data.get("generation_seconds", 0.0))
             props.last_audit_seconds = float(result_data.get("audit_seconds", 0.0))
+            semantic_summary = result_data.get("semantic_summary") or {}
+            props.jev_status = str(result_data.get("semantic_backend", "") or "LOCAL_FALLBACK")
+            props.jev_semantic_summary = json.dumps(semantic_summary, ensure_ascii=False)
+            identity_assets = semantic_summary.get("identity_critical", []) if isinstance(semantic_summary, dict) else []
+            props.jev_identity_assets = "、".join(str(x) for x in identity_assets[:12])
+            props.jev_status_message = (
+                f"语义识别：{props.jev_status} · 关键身份资产 {len(identity_assets)} 个"
+            )
             best_score = result_data.get("best_score", -1)
             try:
                 props.alignment_score = float(best_score)
@@ -1809,19 +1898,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 ]
                 best_variant = int(result_data.get("best_variant", 0) or 0)
                 exported = exported_by_variant.get(best_variant) or exported_paths[0]
-                try:
-                    from . import typesafe_engine
-                    ranked = typesafe_engine.rank_candidates(
-                        [str(p) for p in exported_paths],
-                        str(self._session.viewport_reference),
-                        props.prompt,
-                    )
-                    if ranked:
-                        best_candidate_path, best_meta = ranked[0]
-                        exported = best_candidate_path
-                        props.best_candidate_score = float(best_meta.get("composite_score", 0.0))
-                except Exception:
-                    pass
+                # Candidate selection remains based on real canvas/alignment audit.
+                # 3.1.2's file-size "TypeSafe score" was not a visual-quality metric.
+                props.best_candidate_score = 0.0
                 props.last_export_path = str(exported)
                 props.last_export_paths = json.dumps([str(path) for path in exported_paths], ensure_ascii=False)
                 cid = result_data.get("conversation_id", "")

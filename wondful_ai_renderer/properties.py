@@ -522,10 +522,32 @@ class WONDFUL_AISettings(PropertyGroup):
         min=1,
         max=5,
     )
+    # Kept for .blend compatibility. 3.1.3 no longer fabricates a visual score
+    # from file size; real visual ranking comes from the provider alignment audit.
     best_candidate_score: FloatProperty(
-        name="最优候选评分",
-        description="TypeSafe 对当前推荐预览图的综合质量评分（0-100）",
+        name="旧版候选评分（停用）",
+        description="3.1.3 已停用；文件大小不能代表视觉质量",
         default=0.0,
+        options={"SKIP_SAVE"},
+    )
+    jev_status: StringProperty(
+        name="Jev 状态",
+        default="",
+        options={"SKIP_SAVE"},
+    )
+    jev_status_message: StringProperty(
+        name="Jev 详情",
+        default="",
+        options={"SKIP_SAVE"},
+    )
+    jev_semantic_summary: StringProperty(
+        name="Jev 语义摘要",
+        default="",
+        options={"SKIP_SAVE"},
+    )
+    jev_identity_assets: StringProperty(
+        name="身份关键资产",
+        default="",
         options={"SKIP_SAVE"},
     )
     last_capture_method: StringProperty(default="")

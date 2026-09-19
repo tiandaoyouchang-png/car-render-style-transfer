@@ -1,4 +1,7 @@
-# Wondful AI 渲染器 3.1.1
+# Wondful AI 渲染器 3.1.3
+
+> 3.1.3 新增真实 TypeSafe / Jev 语义层：Semantic Part、Material Resolver、Logo/字标身份资产保护、修改范围判断与批量参考图分类；未配置 `TYPESAFE_API_KEY` 时自动使用本地规则回退。详见 `CHANGELOG_3.1.3.md`。
+
 
 基于 3.1.0 源码的修复版。处理参考图超限、AGY 登录入口、具体模型选择、长提示词阅读，以及 AGY 生图工具调用与位图回收问题。
 
