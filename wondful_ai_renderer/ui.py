@@ -354,7 +354,9 @@ class WONDFUL_PT_main(Panel):
         if opened:
             if total > 0 and not busy:
                 action_row = refs.row(align=True)
-                action_row.operator("wondful.auto_classify_references", text="TypeSafe 智能分类", icon="LIGHT")
+                action_row.operator("wondful.auto_classify_references", text="Jev 智能分类", icon="LIGHT")
+            if getattr(props, "jev_status_message", ""):
+                refs.label(text=props.jev_status_message[:110], icon="INFO")
             _draw_reference_group(refs, props, "产品造型", "product_images", "product_image_index", "PRODUCT", "ui_show_product_refs")
             _draw_reference_group(refs, props, "人物", "person_images", "person_image_index", "PERSON", "ui_show_person_refs")
             _draw_reference_group(refs, props, "环境／风格", "style_images", "style_image_index", "STYLE", "ui_show_style_refs")
@@ -475,8 +477,10 @@ class WONDFUL_PT_main(Panel):
                 result_box.label(text=f"本次已导出 {props.variant_count} 张独立结果；上方预览为最佳图", icon="IMAGE_DATA")
             if props.alignment_attempts:
                 result_box.label(text=f"生成尝试 {props.alignment_attempts} 次 · Session {props.last_session_id}", icon="INFO")
-            if getattr(props, "best_candidate_score", 0.0) > 0:
-                result_box.label(text=f"TypeSafe 优选评分：{props.best_candidate_score:.1f} / 100", icon="SOLO_ON")
+            if getattr(props, "jev_identity_assets", ""):
+                result_box.label(text=f"身份关键资产：{props.jev_identity_assets[:100]}", icon="LOCKED")
+            if getattr(props, "jev_status", ""):
+                result_box.label(text=f"语义层：{props.jev_status}", icon="LIGHT")
             if getattr(props, "active_conversation_id", ""):
                 conv_row = result_box.row(align=True)
                 conv_row.label(text=f"远程会话：{props.active_conversation_id[:18]}...", icon="WORLD")
@@ -499,6 +503,15 @@ class WONDFUL_PT_main(Panel):
         row = advanced.row(align=True)
         opened = _disclosure(row, props, "ui_show_advanced", "高级设置", icon="PREFERENCES")
         if opened:
+            from . import jev_semantics
+            jev = jev_semantics.backend_status()
+            jev_box = advanced.box()
+            jev_box.label(text="TypeSafe / Jev 语义层", icon="LIGHT")
+            jev_box.label(text=jev.get("message", "Jev 状态未知")[:110])
+            if not jev.get("configured"):
+                jev_box.label(text="设置环境变量 TYPESAFE_API_KEY 后启用真实 Jev；未配置时自动使用本地规则。", icon="INFO")
+            else:
+                jev_box.label(text="Jev 仅负责语义判断；构图/几何仍由 Blender，最终视觉仍由当前生图 Provider 负责。", icon="INFO")
             # When already logged in, account management lives here instead of
             # consuming space in the primary workflow.
             if state == "LOGGED_IN":
