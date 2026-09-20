@@ -32,8 +32,8 @@ def bundle_plan(groups, reserve=0, limit=MAX_IMAGE_PATHS):
     if not groups or groups[0][0] != "camera" or len(groups[0][1]) != 1:
         raise ValueError("One authoritative camera image is required")
     slots = limit - reserve
-    if slots < 3:
-        raise ValueError("Not enough slots for camera, structure and appearance")
+    if slots < 2:
+        raise ValueError("Not enough slots for camera plus bundled references")
     numbered, index = [], 1
     for group in groups:
         if len(group) == 2:
@@ -58,6 +58,12 @@ def bundle_plan(groups, reserve=0, limit=MAX_IMAGE_PATHS):
         fixed = [g for g in numbered if g["role"] in {"camera", "structure"}]
         appearance = [m for g in numbered if g["role"] not in {"camera", "structure"} for m in g["members"]]
         numbered = fixed + ([{"role": "appearance", "members": appearance}] if appearance else [])
+    if len(numbered) > slots and slots == 2:
+        camera_group = next((g for g in numbered if g["role"] == "camera"), None)
+        if camera_group is None:
+            raise ReferenceLimitError("缺少 Camera Base。")
+        merged_members = [m for g in numbered if g is not camera_group for m in g["members"]]
+        numbered = [camera_group] + ([{"role": "control_bundle", "members": merged_members}] if merged_members else [])
     if len(numbered) > slots:
         raise ReferenceLimitError("参考图无法在当前容量中完整编排。")
     return numbered

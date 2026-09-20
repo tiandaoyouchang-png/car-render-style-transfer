@@ -43,7 +43,7 @@ from .structure_control import (
 )
 
 
-PACKET_VERSION = "3.0.10"
+PACKET_VERSION = "3.0.11"
 _NATIVE_MAX_EDGE = 1536
 
 
@@ -182,7 +182,14 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
     if not product_objects:
         raise RuntimeError("EMPTY_PRODUCT_COLLECTION")
 
-    packet_w, packet_h = ((int(width), int(height)) if render_mode == "STRICT" else _packet_resolution(width, height))
+    # 3.1.5: Standard also renders native Object Index at the full camera grid.
+    # Small logos/wordmarks must not disappear in a lower-resolution Part-ID pass
+    # before the Identity Preserve Mask is derived. FAST keeps the bounded raster.
+    packet_w, packet_h = (
+        (int(width), int(height))
+        if render_mode in {"STRICT", "STANDARD"}
+        else _packet_resolution(width, height)
+    )
     raster_size = (packet_w, packet_h)
     temp_scene = bpy.data.scenes.new("Wondful_StructurePacket_" + uuid.uuid4().hex[:8])
     pass_index_snapshot: dict[str, tuple[bpy.types.Object, int]] = {}
@@ -345,6 +352,8 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
         mask_path = output_dir / "02_product_mask.png"
         silhouette_path = output_dir / "05_product_silhouette.png"
         part_path = output_dir / "06_part_id.png"
+        part_index_path = output_dir / "06_part_index.npy"
+        np.save(str(part_index_path), index_values.astype(np.int32), allow_pickle=False)
         _save_scalar_png(depth_path, depth_norm, "Wondful_SceneDepth")
         _save_rgba(normal_path, normal_png, "Wondful_SceneNormal")
         _save_rgba(mask_path, mask_rgba, "Wondful_ProductMask")
@@ -379,6 +388,7 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
             "normal_path": str(normal_path),
             "silhouette_path": str(silhouette_path),
             "part_id_path": str(part_path),
+            "part_index_path": str(part_index_path),
             "edit_mask_path": str(edit_mask_path),
             "part_id_manifest": part_manifest,
             "bbox_pixels_packet": [round(v, 2) for v in bbox],
@@ -571,6 +581,7 @@ def build_structure_packet(
         packet.setdefault("depth_path", "")
         packet.setdefault("normal_path", "")
         packet.setdefault("part_id_path", "")
+        packet.setdefault("part_index_path", "")
 
     # In 3.0 the clean silhouette is the visual audit guide.  Dense topology
     # wireframes are diagnostic only and are not sent to the generator by default.

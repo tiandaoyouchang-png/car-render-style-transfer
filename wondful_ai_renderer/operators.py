@@ -1393,6 +1393,16 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 )
                 if image_dimensions(variant_final) != (camera_w, camera_h):
                     raise RuntimeError(f"第 {variant_index} 张结果无法适配为 {camera_w}×{camera_h}。")
+                identity_meta = getattr(self, "_identity_meta", {}) or {}
+                if getattr(self, "_identity_hard_restore", False) and identity_meta.get("enabled"):
+                    from .identity_preserve import hard_restore_identity_pixels
+                    restored_path = self._session.directory / f"output_variant_{variant_index:02d}_identity_restored.png"
+                    variant_final = Path(hard_restore_identity_pixels(
+                        variant_final,
+                        getattr(self, "_identity_source_path", ""),
+                        identity_meta.get("path", ""),
+                        restored_path,
+                    ))
                 exported = export_result(
                     variant_final,
                     self._output_dir_at_start,
@@ -1571,9 +1581,15 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
         # generate_image endpoint accepts only three paths total, so its repair
         # pass is reduced to the camera + edit base + mask below instead of
         # reserving slots that would make the initial bundle impossible.
-        reserve = 2 if (reference_limit >= 5 and render_mode == "STRICT" and prefs.auto_alignment_retry
-                        and prefs.masked_alignment_repair and structure.get("edit_mask_path")
-                        and int(prefs.alignment_max_attempts) > 1) else 0
+        identity_preserve_enabled = bool(getattr(prefs, "identity_preserve_enabled", True))
+        identity_preserve_padding = int(getattr(prefs, "identity_preserve_padding", 2))
+        identity_hard_restore = bool(getattr(prefs, "identity_hard_restore", False))
+        identity_possible = bool(identity_preserve_enabled and structure.get("part_index_path"))
+        repair_reserve = 2 if (reference_limit >= 5 and render_mode == "STRICT" and prefs.auto_alignment_retry
+                               and prefs.masked_alignment_repair and structure.get("edit_mask_path")
+                               and int(prefs.alignment_max_attempts) > 1) else 0
+        identity_reserve = 1 if identity_possible else 0
+        reserve = max(repair_reserve, identity_reserve)
         try:
             references, bundle_note, self._reference_bundle = prepare_bundle(
                 [
@@ -1645,6 +1661,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
         )
         edit_mask_path = str(structure.get("edit_mask_path", "")) if structure.get("enabled") else ""
         masked_repair = bool(prefs.masked_alignment_repair and edit_mask_path)
+        self._identity_hard_restore = identity_hard_restore
+        self._identity_source_path = camera_base
+        self._identity_meta = {}
 
         def job():
             from . import jev_semantics
@@ -1681,6 +1700,29 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
             semantic_meta["preserve_identity"] = preserve_identity
             semantic_meta["change_scope"] = (decision_meta.get("change_scope") or {}).get("choice", "")
             semantic_meta["decision_usage"] = decision_meta.get("usage", {})
+
+            from .identity_preserve import build_identity_preserve_mask, write_identity_edit_mask
+            identity_meta = {"enabled": False, "reason": "DISABLED", "path": ""}
+            identity_full_edit_mask = ""
+            if identity_preserve_enabled and preserve_identity and structure.get("part_index_path"):
+                identity_meta = build_identity_preserve_mask(
+                    structure.get("part_index_path", ""),
+                    semantic_results,
+                    self._session.directory / "identity_preserve_mask.png",
+                    padding_px=identity_preserve_padding,
+                )
+                if identity_meta.get("enabled"):
+                    identity_full_edit_mask = write_identity_edit_mask(
+                        self._session.directory / "identity_edit_mask.png",
+                        identity_meta["mask_npy_path"],
+                    )
+                    effective_render_prompt += (
+                        "\n\n【Identity Preserve Mask｜最高优先级身份保护】\n"
+                        "本轮编辑 Mask 中的不透明区域是 Logo、品牌/车型字标、车牌文字或可读 UI 等身份资产。"
+                        "这些区域不得重新绘制、改字、改形、改比例或风格化；仅透明区域允许外观编辑。"
+                    )
+            semantic_meta["identity_mask"] = identity_meta
+            self._identity_meta = identity_meta
             if is_cancellation_requested():
                 raise RuntimeError("任务已取消")
 
@@ -1714,8 +1756,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                             "按本轮提供的底图和修复范围恢复白模构图。具体纠偏：" + correction
                         )
 
-                    edit_base, edit_mask = camera_base, ""
-                    repair_strategy = "WHITE_MODEL_REBASE" if correction else "WHITE_MODEL"
+                    edit_base, edit_mask = camera_base, identity_full_edit_mask
+                    repair_strategy = ("IDENTITY_PRESERVE_MASK" if identity_full_edit_mask else
+                                       ("WHITE_MODEL_REBASE" if correction else "WHITE_MODEL"))
                     region = None
                     if correction and variant_attempts and masked_repair:
                         previous = variant_attempts[-1]
@@ -1724,11 +1767,19 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                                                (camera_w, camera_h), alignment_threshold)
                         if region is not None:
                             edit_base = previous["path"]
-                            edit_mask = write_repair_mask(
-                                self._session.directory / f"repair_mask_v{variant_index:02d}_a{attempt_index:02d}.png",
-                                previous["canvas"]["actual_size"], region,
-                            )
-                            repair_strategy = "UNION_MASK"
+                            if identity_meta.get("enabled"):
+                                edit_mask = write_identity_edit_mask(
+                                    self._session.directory / f"repair_identity_mask_v{variant_index:02d}_a{attempt_index:02d}.png",
+                                    identity_meta["mask_npy_path"],
+                                    editable_region=region,
+                                )
+                                repair_strategy = "UNION_MASK_PLUS_IDENTITY_PRESERVE"
+                            else:
+                                edit_mask = write_repair_mask(
+                                    self._session.directory / f"repair_mask_v{variant_index:02d}_a{attempt_index:02d}.png",
+                                    previous["canvas"]["actual_size"], region,
+                                )
+                                repair_strategy = "UNION_MASK"
                     if correction:
                         attempt_prompt += (
                             "\n本轮 Mask 同时覆盖偏移主体与目标位置；先清除旧位置残影，再在白模位置恢复主体。"
@@ -1738,7 +1789,7 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                     generation_started = time.time()
                     self._phase = f"生成第 {variant_index}/{variant_count} 张 · 尝试 {attempt_index}/{planned_attempts}"
                     generation_references = references
-                    if provider_id == "antigravity" and edit_mask:
+                    if provider_id == "antigravity" and edit_mask and region is not None:
                         # AGY accepts three ImagePaths total. A masked repair already
                         # has edit_base + mask, so keep the authoritative camera only
                         # and let the previous candidate carry the appearance state.
@@ -1886,6 +1937,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 "generation_seconds": total_generation_seconds,
                 "audit_seconds": total_audit_seconds,
                 "semantic_summary": semantic_meta,
+                "identity_mask": identity_meta,
+                "identity_mask_path": str(identity_meta.get("path", "") or ""),
+                "identity_hard_restore": bool(identity_hard_restore and identity_meta.get("enabled")),
                 "semantic_backend": (
                     "MIXED" if semantic_meta.get("backends", {}).get("JEV", 0) and semantic_meta.get("backends", {}).get("LOCAL_FALLBACK", 0)
                     else ("JEV" if semantic_meta.get("backends", {}).get("JEV", 0) else "LOCAL_FALLBACK")
@@ -2022,7 +2076,7 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 return {"CANCELLED"}
             try:
                 props.viewport_image = load_image(str(self._session.viewport_reference), "Wondful_Camera")
-                props.result_image = load_image(final_path, "Wondful_Result")
+                props.result_image = load_image(str(exported), "Wondful_Result")
                 mask_path = str(self._structure.get("mask_path", ""))
                 props.structure_mask_image = load_image(mask_path, "Wondful_StructureMask") if mask_path and Path(mask_path).is_file() else None
             except Exception as exc:
@@ -2073,6 +2127,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                     "strict_composition_lock": bool(prefs.strict_composition_lock),
                     "structure_control": result_data.get("structure_control", self._structure or {}),
                     "masked_alignment_repair": bool(result_data.get("masked_repair", False)),
+                    "identity_preserve_mask": result_data.get("identity_mask", {}),
+                    "identity_preserve_mask_path": result_data.get("identity_mask_path", ""),
+                    "identity_hard_restore": bool(result_data.get("identity_hard_restore", False)),
                     "provider_response": self._result,
                 },
             )
