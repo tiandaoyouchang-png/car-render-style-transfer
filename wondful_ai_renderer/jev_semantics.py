@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -25,7 +26,10 @@ DEFAULT_BASE_URL = "https://api.typesafe.ai"
 DEFAULT_MODEL = "jev-latest"
 SYSTEM_ONE_PATH = "/v1/systemone"
 REFERENCE_CONFIDENCE_THRESHOLD = 0.62
-SEMANTIC_CONFIDENCE_THRESHOLD = 0.58
+SEMANTIC_CONFIDENCE_THRESHOLD = 0.68
+MATERIAL_CONFIDENCE_THRESHOLD = 0.70
+IDENTITY_PROTECT_THRESHOLD = 0.80
+SEMANTIC_SCHEMA_VERSION = "3.1.4-1"
 
 PART_CLASSES = {
     "BODY_PANEL": "car body panel or exterior painted structural surface",
@@ -113,6 +117,15 @@ def _key() -> str:
     return os.environ.get(API_KEY_ENV, "").strip()
 
 
+def _raise_if_cancelled() -> None:
+    try:
+        from .cli_transport import is_cancellation_requested
+        if is_cancellation_requested():
+            raise JevError("TASK_CANCELLED")
+    except ImportError:
+        return
+
+
 def backend_status() -> dict[str, Any]:
     configured = bool(_key())
     model = os.environ.get(MODEL_ENV, DEFAULT_MODEL).strip() or DEFAULT_MODEL
@@ -120,7 +133,7 @@ def backend_status() -> dict[str, Any]:
         "mode": "JEV" if configured else "LOCAL_FALLBACK",
         "configured": configured,
         "model": model,
-        "message": f"Jev ready · {model}" if configured else f"{API_KEY_ENV} not set · local fallback",
+        "message": f"Jev configured · {model}" if configured else f"{API_KEY_ENV} not set · local fallback",
     }
 
 
@@ -143,16 +156,36 @@ def _system_one(state: Any, questions: dict[str, Any], timeout: float = 10.0) ->
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "wondful-ai-renderer/3.1.3",
+            "User-Agent": "wondful-ai-renderer/3.1.4",
         },
     )
     last = ""
     for attempt in range(2):
+        _raise_if_cancelled()
         try:
             with urlrequest.urlopen(req, timeout=max(1.0, float(timeout))) as response:
                 data = json.loads(response.read().decode("utf-8"))
+            _raise_if_cancelled()
             if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
                 raise JevError("Invalid TypeSafe response")
+            answers = data["answers"]
+            missing = [name for name in questions if name not in answers]
+            if missing:
+                raise JevError("TypeSafe response missing answers: " + ", ".join(missing[:8]))
+            for name, question in questions.items():
+                answer = answers.get(name)
+                expected = str(question.get("type", ""))
+                if not isinstance(answer, dict) or answer.get("type") != expected:
+                    raise JevError(f"TypeSafe answer {name} has invalid type")
+                if expected == "choice":
+                    if not str(answer.get("choice", "")).strip() or not isinstance(answer.get("probabilities"), dict):
+                        raise JevError(f"TypeSafe choice answer {name} is incomplete")
+                elif expected == "noul":
+                    if not isinstance(answer.get("noul"), (int, float)):
+                        raise JevError(f"TypeSafe noul answer {name} is incomplete")
+                elif expected == "score":
+                    if not isinstance(answer.get("score"), (int, float)):
+                        raise JevError(f"TypeSafe score answer {name} is incomplete")
             return data
         except urlerror.HTTPError as exc:
             try:
@@ -162,11 +195,13 @@ def _system_one(state: Any, questions: dict[str, Any], timeout: float = 10.0) ->
             last = f"HTTP {exc.code}: {detail or exc.reason}"
             if exc.code not in {429, 500, 502, 503, 504} or attempt:
                 break
+            _raise_if_cancelled()
             time.sleep(0.35)
         except Exception as exc:
             last = f"{type(exc).__name__}: {exc}"
             if attempt:
                 break
+            _raise_if_cancelled()
             time.sleep(0.2)
     raise JevError(last or "TypeSafe request failed")
 
@@ -186,52 +221,27 @@ def _choice(answer: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _noul(answer: dict[str, Any]) -> float:
+def _noul(answer: dict[str, Any]) -> float | None:
     try:
-        return max(0.0, min(1.0, float(answer.get("noul", 0.5))))
+        if not isinstance(answer, dict) or not isinstance(answer.get("noul"), (int, float)):
+            return None
+        return max(0.0, min(1.0, float(answer["noul"])))
     except Exception:
-        return 0.5
+        return None
 
 
-def _score(answer: dict[str, Any], descriptions: list[str]) -> dict[str, Any]:
+def _score(answer: dict[str, Any], descriptions: list[str]) -> dict[str, Any] | None:
     try:
-        raw = float(answer.get("score", 0.0))
+        if not isinstance(answer, dict) or not isinstance(answer.get("score"), (int, float)):
+            return None
+        raw = float(answer["score"])
     except Exception:
-        raw = 0.0
+        return None
     level = max(1, min(len(descriptions), int(round(raw)) + 1))
     return {"level": level, "score": raw + 1.0, "description": descriptions[level - 1]}
 
 
-def classify_reference_intent(filepath: str, instruction: str = "", current_kind: str = "") -> dict[str, Any]:
-    state = {
-        "filename": Path(filepath).name,
-        "instruction": instruction or "",
-        "current_category": current_kind or "",
-    }
-    if _key():
-        try:
-            data = _system_one(
-                state,
-                {
-                    "role": {
-                        "type": "choice",
-                        "instructions": (
-                            "Classify the intended role of this reference in a rendering workflow. "
-                            "Choose a single category only when evidence is clear. Use MIXED when multiple "
-                            "roles are equally important and UNSURE when evidence is insufficient."
-                        ),
-                        "criteria": REFERENCE_ROLES,
-                    }
-                },
-            )
-            result = _choice(data["answers"].get("role", {}))
-            result.update({"backend": "JEV", "model": data.get("model", DEFAULT_MODEL), "error": ""})
-            return result
-        except Exception as exc:
-            error_text = str(exc)
-    else:
-        error_text = ""
-
+def _local_reference_intent(filepath: str, instruction: str = "", current_kind: str = "", error_text: str = "") -> dict[str, Any]:
     text = f"{Path(filepath).stem} {instruction}".lower()
     groups = {
         "PRODUCT": ("product", "part", "body", "wheel", "lamp", "造型", "车身", "轮毂", "产品"),
@@ -249,6 +259,36 @@ def classify_reference_intent(filepath: str, instruction: str = "", current_kind
         choice = ranked[0][0]
         confidence = min(0.95, 0.55 + 0.12 * ranked[0][1])
     return {"choice": choice, "confidence": confidence, "probabilities": {}, "backend": "LOCAL_FALLBACK", "error": error_text}
+
+
+def classify_reference_intent(filepath: str, instruction: str = "", current_kind: str = "") -> dict[str, Any]:
+    state = {
+        "filename": Path(filepath).name,
+        "instruction": instruction or "",
+        "current_category": current_kind or "",
+    }
+    if _key():
+        try:
+            data = _system_one(
+                state,
+                {
+                    "role": {
+                        "type": "choice",
+                        "instructions": (
+                            "Classify the intended role of this reference from filename and user note only. "
+                            "You cannot see image pixels. Choose PRODUCT/STYLE/PERSON only with clear textual evidence; "
+                            "otherwise use MIXED or UNSURE."
+                        ),
+                        "criteria": REFERENCE_ROLES,
+                    }
+                },
+            )
+            result = _choice(data["answers"]["role"])
+            result.update({"backend": "JEV", "model": data.get("model", DEFAULT_MODEL), "error": ""})
+            return result
+        except Exception as exc:
+            return _local_reference_intent(filepath, instruction, current_kind, str(exc))
+    return _local_reference_intent(filepath, instruction, current_kind)
 
 
 def classify_references_batch(items: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -295,39 +335,36 @@ def classify_references_batch(items: list[dict[str, str]]) -> list[dict[str, Any
     else:
         error_text = ""
 
-    output = []
-    for item in items:
-        row = classify_reference_intent(
+    # A failed batch must not fan out into N more remote requests. Fall back
+    # locally for the whole batch and surface the original error.
+    return [
+        _local_reference_intent(
             item.get("filepath", ""),
             item.get("instruction", ""),
             item.get("current_kind", ""),
+            error_text,
         )
-        if error_text and not row.get("error"):
-            row["error"] = error_text
-        output.append(row)
-    return output
+        for item in items
+    ]
 
 
 def analyze_appearance(brief: str, style_notes: list[str] | None = None) -> dict[str, Any]:
+    """Use Jev for workflow decisions, not for inventing visual aesthetics."""
     state = {
         "creative_brief": brief or "",
         "style_notes": list(style_notes or []),
-        "workflow_rule": "Blender owns camera, composition and geometry unless the user explicitly asks to change them.",
+        "workflow_rule": "Blender owns camera/composition/geometry. Style images and the vision provider own appearance.",
     }
     questions = {
-        "theme": {"type": "choice", "instructions": "Choose the primary visual theme.", "criteria": THEMES},
-        "contrast": {"type": "score", "instructions": "Judge target lighting contrast.", "criteria": CONTRAST_LEVELS},
-        "gloss": {"type": "score", "instructions": "Judge overall material gloss. Do not let one glass or chrome part dominate the whole product.", "criteria": GLOSS_LEVELS},
-        "detail": {"type": "score", "instructions": "Judge target surface and industrial detail density.", "criteria": DETAIL_LEVELS},
         "scope": {
             "type": "choice",
-            "instructions": "Determine what the user actually wants changed. Respect explicit keep/unchanged constraints.",
+            "instructions": "Determine only what the user explicitly wants changed. Do not invent a visual style.",
             "criteria": {
                 "MATERIAL_ONLY": "materials or paint only",
                 "LIGHTING_ONLY": "lighting only",
                 "ENVIRONMENT_ONLY": "environment, weather or background only",
                 "COLOR_ONLY": "color only",
-                "FULL_APPEARANCE": "materials, lighting and environment may change, but not Blender geometry/camera",
+                "FULL_APPEARANCE": "multiple appearance categories may change, but not Blender geometry/camera",
                 "GEOMETRY_REQUEST": "explicit geometry or shape change",
                 "COMPOSITION_REQUEST": "explicit camera, framing, scale or position change",
                 "AMBIGUOUS": "insufficient evidence",
@@ -335,8 +372,8 @@ def analyze_appearance(brief: str, style_notes: list[str] | None = None) -> dict
         },
         "preserve_identity": {
             "type": "noul",
-            "instructions": "Should brand logos, wordmarks, model text, plate characters and readable screen text be strictly preserved?",
-            "criteria": {"true": "preserve exact identity assets", "false": "user explicitly wants them changed"},
+            "instructions": "Unless the user explicitly requests changing brand identity/text, should logos, wordmarks, model text, plate characters and readable screen text be preserved?",
+            "criteria": {"true": "preserve exact identity assets", "false": "user explicitly requested identity/text replacement"},
         },
         "structural_change": {
             "type": "noul",
@@ -349,13 +386,9 @@ def analyze_appearance(brief: str, style_notes: list[str] | None = None) -> dict
             data = _system_one(state, questions)
             answers = data["answers"]
             result = {
-                "theme": _choice(answers.get("theme", {})),
-                "lighting_contrast": _score(answers.get("contrast", {}), CONTRAST_LEVELS),
-                "material_gloss": _score(answers.get("gloss", {}), GLOSS_LEVELS),
-                "detail_density": _score(answers.get("detail", {}), DETAIL_LEVELS),
-                "change_scope": _choice(answers.get("scope", {})),
-                "preserve_identity_probability": _noul(answers.get("preserve_identity", {})),
-                "structural_change_probability": _noul(answers.get("structural_change", {})),
+                "change_scope": _choice(answers["scope"]),
+                "preserve_identity_probability": _noul(answers["preserve_identity"]),
+                "structural_change_probability": _noul(answers["structural_change"]),
                 "backend": "JEV",
                 "model": data.get("model", DEFAULT_MODEL),
                 "usage": data.get("usage", {}),
@@ -369,35 +402,29 @@ def analyze_appearance(brief: str, style_notes: list[str] | None = None) -> dict
         error_text = ""
 
     text = f"{brief} {' '.join(style_notes or [])}".lower()
-    theme = "COMMERCIAL_STUDIO"
-    for candidate, words in {
-        "CINEMATIC_DRAMATIC": ("电影", "戏剧", "cinematic", "dramatic"),
-        "MINIMALIST_INDUSTRIAL": ("极简", "工业", "minimal", "industrial"),
-        "CYBER_TECH": ("赛博", "未来", "科技", "cyber", "future"),
-        "NATURAL_LIFESTYLE": ("自然", "户外", "生活", "outdoor", "sunlight"),
-    }.items():
-        if any(word in text for word in words):
-            theme = candidate
-            break
-    contrast = 4 if any(word in text for word in ("高反差", "戏剧", "dramatic")) else 2 if any(word in text for word in ("柔和", "漫射", "soft")) else 3
-    gloss = 5 if any(word in text for word in ("镜面", "镀铬", "chrome")) else 4 if any(word in text for word in ("高光", "gloss")) else 2 if any(word in text for word in ("哑光", "matte")) else 3
-    detail = 5 if any(word in text for word in ("精密", "微观", "detailed")) else 2 if any(word in text for word in ("极简", "minimal")) else 4
-    scope = "FULL_APPEARANCE"
-    if any(word in text for word in ("只改材质", "仅改材质", "material only")):
+    scope = "AMBIGUOUS"
+    if any(word in text for word in ("只改材质", "仅改材质", "material only", "车漆换", "材质换")):
         scope = "MATERIAL_ONLY"
     elif any(word in text for word in ("只改灯光", "仅改灯光", "lighting only")):
         scope = "LIGHTING_ONLY"
-    elif any(word in text for word in ("只换环境", "换背景", "environment only")):
+    elif any(word in text for word in ("只换环境", "换背景", "换成雨天", "换成雪天", "environment only")):
         scope = "ENVIRONMENT_ONLY"
+    elif any(word in text for word in ("镜头改", "构图改", "camera", "framing", "reframe")):
+        scope = "COMPOSITION_REQUEST"
+    elif any(word in text for word in ("几何", "造型改", "车身加", "geometry", "shape change")):
+        scope = "GEOMETRY_REQUEST"
+
+    identity_change = any(word in text for word in (
+        "换logo", "换 logo", "替换logo", "替换 logo", "改logo", "改 logo",
+        "换车标", "替换车标", "change logo", "replace logo", "replace badge",
+    ))
+    structural = scope in {"GEOMETRY_REQUEST", "COMPOSITION_REQUEST"}
     result = {
-        "theme": {"choice": theme, "confidence": 0.6},
-        "lighting_contrast": {"level": contrast, "score": float(contrast), "description": CONTRAST_LEVELS[contrast - 1]},
-        "material_gloss": {"level": gloss, "score": float(gloss), "description": GLOSS_LEVELS[gloss - 1]},
-        "detail_density": {"level": detail, "score": float(detail), "description": DETAIL_LEVELS[detail - 1]},
-        "change_scope": {"choice": scope, "confidence": 0.6},
-        "preserve_identity_probability": 0.92,
-        "structural_change_probability": 0.12,
+        "change_scope": {"choice": scope, "confidence": 0.78 if scope != "AMBIGUOUS" else 0.30},
+        "preserve_identity_probability": 0.05 if identity_change else 0.95,
+        "structural_change_probability": 0.95 if structural else 0.10,
         "backend": "LOCAL_FALLBACK",
+        "usage": {},
         "error": error_text,
     }
     result["synthesized"] = _appearance_text(result)
@@ -405,17 +432,17 @@ def analyze_appearance(brief: str, style_notes: list[str] | None = None) -> dict
 
 
 def _appearance_text(result: dict[str, Any]) -> str:
-    theme = result["theme"].get("choice", "COMMERCIAL_STUDIO")
-    scope = result["change_scope"].get("choice", "FULL_APPEARANCE")
-    preserve = float(result.get("preserve_identity_probability", 0.0)) >= 0.5
-    return (
-        f"视觉主题：{THEMES.get(theme, theme)}。"
-        f"光照：{result['lighting_contrast']['description']}。"
-        f"材质高光：{result['material_gloss']['description']}。"
-        f"细节：{result['detail_density']['description']}。"
-        f"本轮修改范围：{scope}。"
-        + ("车标、字标、车型文字、车牌和屏幕可读文字属于身份关键资产，必须保持原始形状、字形、位置和比例，不得臆造。" if preserve else "")
-    )
+    scope = (result.get("change_scope") or {}).get("choice", "AMBIGUOUS")
+    preserve = result.get("preserve_identity_probability")
+    structural = result.get("structural_change_probability")
+    lines = [f"本轮修改范围判断：{scope}。"]
+    if isinstance(preserve, (int, float)) and preserve >= IDENTITY_PROTECT_THRESHOLD:
+        lines.append("除非用户明确要求替换，车标、字标、车型文字、车牌和可读屏幕文字必须保持原始身份。")
+    elif isinstance(preserve, (int, float)) and preserve <= 0.20:
+        lines.append("用户明确要求修改身份资产；不要应用默认身份保护到被明确指定的目标。")
+    if isinstance(structural, (int, float)) and structural >= 0.80:
+        lines.append("检测到结构或构图修改请求：不要让生图模型擅自实现，应回到 Blender 结构/相机阶段处理。")
+    return "".join(lines)
 
 
 def _scalar(node: Any, *names: str) -> float | None:
@@ -459,8 +486,6 @@ def collect_product_object_states(context: Any, props: Any, part_manifest: dict[
     for obj in collection.all_objects:
         if getattr(obj, "type", "") != "MESH" or getattr(obj, "hide_render", False):
             continue
-        if names and obj.name not in names:
-            continue
         try:
             if context.scene.objects.get(obj.name) is None:
                 continue
@@ -494,11 +519,29 @@ def collect_product_object_states(context: Any, props: Any, part_manifest: dict[
             "polygon_count": int(polygon_count),
             "materials": materials,
         }
+        item["part_id_visible"] = obj.name in manifest
         if obj.name in manifest:
             item["part_id_rgb"] = manifest[obj.name].get("rgb", [])
             item["part_id_index"] = manifest[obj.name].get("index")
         rows.append(item)
     return rows
+
+
+def _semantic_tokens(text: str) -> set[str]:
+    expanded = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(text or ""))
+    return {token for token in re.split(r"[^A-Za-z0-9\u4e00-\u9fff]+", expanded.lower()) if token}
+
+
+def _matches(text: str, words: tuple[str, ...]) -> bool:
+    tokens = _semantic_tokens(text)
+    for word in words:
+        value = word.lower()
+        if any("\u4e00" <= ch <= "\u9fff" for ch in value):
+            if value in text:
+                return True
+        elif value in tokens:
+            return True
+    return False
 
 
 def _object_text(state: dict[str, Any]) -> str:
@@ -531,7 +574,7 @@ def _local_object_semantics(state: dict[str, Any], error_text: str = "") -> dict
         (("door", "hood", "bonnet", "fender", "roof", "trunk", "bumper", "body", "车门", "机盖", "翼子板", "车顶"), "BODY_PANEL", 0.84, 0.06),
     ]
     for words, label, confidence, critical_probability in rules:
-        if any(word in text for word in words):
+        if _matches(text, words):
             part, part_confidence, critical = label, confidence, critical_probability
             break
 
@@ -544,25 +587,27 @@ def _local_object_semantics(state: dict[str, Any], error_text: str = "") -> dict
     roughness = sum(roughness_values) / len(roughness_values) if roughness_values else 0.5
 
     material_class, material_confidence = "OTHER", 0.45
-    if part == "TIRE" or any(word in names for word in ("rubber", "tire", "tyre")):
+    if part == "TIRE" or _matches(names, ("rubber", "tire", "tyre")):
         material_class, material_confidence = "RUBBER", 0.98
-    elif part in {"HEADLAMP", "TAILLAMP"} or any(word in names for word in ("lens", "optical")):
+    elif _matches(names, ("lens", "optical")):
         material_class, material_confidence = ("EMISSIVE" if emission > 0.05 else "OPTICAL"), 0.91
+    elif part in {"HEADLAMP", "TAILLAMP"} and emission > 0.05:
+        material_class, material_confidence = "EMISSIVE", 0.84
     elif part == "MIRROR" or "mirror" in names:
         material_class, material_confidence = "MIRROR", 0.95
     elif "chrome" in names or "镀铬" in names:
         material_class, material_confidence = "CHROME", 0.96
-    elif part == "GLASS" or transmission > 0.45 or any(word in names for word in ("glass", "window", "windshield")):
+    elif part == "GLASS" or transmission > 0.45 or _matches(names, ("glass", "window", "windshield")):
         material_class, material_confidence = "GLASS", 0.93
     elif emission > 0.05:
         material_class, material_confidence = "EMISSIVE", 0.9
-    elif any(word in names for word in ("paint", "carpaint", "body_paint", "车漆")):
+    elif _matches(names, ("paint", "carpaint", "body_paint", "车漆")):
         material_class, material_confidence = "PAINT", 0.93
-    elif metallic > 0.7:
-        material_class, material_confidence = "METAL", 0.86
-    elif any(word in names for word in ("leather", "fabric", "alcantara", "皮革", "织物")) or part == "INTERIOR":
-        material_class, material_confidence = "INTERIOR_SOFT", 0.82
-    elif any(word in names for word in ("black", "abs", "plastic", "塑料")):
+    elif metallic > 0.7 and part in {"WHEEL", "BRAKE", "CHROME_TRIM", "OTHER"}:
+        material_class, material_confidence = "METAL", 0.72
+    elif _matches(names, ("leather", "fabric", "alcantara", "皮革", "织物")):
+        material_class, material_confidence = "INTERIOR_SOFT", 0.88
+    elif _matches(names, ("black", "abs", "plastic", "塑料")):
         material_class = "GLOSSY_PLASTIC" if roughness < 0.28 else ("BLACK_PLASTIC" if "black" in names else "MATTE_PLASTIC")
         material_confidence = 0.78
 
@@ -573,7 +618,7 @@ def _local_object_semantics(state: dict[str, Any], error_text: str = "") -> dict
         "material_class": material_class,
         "material_confidence": material_confidence,
         "identity_critical_probability": critical,
-        "identity_critical": critical >= 0.5,
+        "identity_critical": critical >= IDENTITY_PROTECT_THRESHOLD,
         "backend": "LOCAL_FALLBACK",
         "error": error_text,
         "part_id_rgb": state.get("part_id_rgb", []),
@@ -582,7 +627,13 @@ def _local_object_semantics(state: dict[str, Any], error_text: str = "") -> dict
 
 
 def _cache_key(state: dict[str, Any]) -> str:
-    raw = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    envelope = {
+        "schema": SEMANTIC_SCHEMA_VERSION,
+        "backend": "JEV" if _key() else "LOCAL",
+        "model": os.environ.get(MODEL_ENV, DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        "state": state,
+    }
+    raw = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -629,7 +680,9 @@ def resolve_object_semantics_batch(states: list[dict[str, Any]], batch_size: int
                 for local_index, (global_index, state, key) in enumerate(group):
                     part = _choice(answers.get(f"part_{local_index}", {}))
                     material = _choice(answers.get(f"material_{local_index}", {}))
-                    critical = _noul(answers.get(f"critical_{local_index}", {}))
+                    critical = _noul(answers[f"critical_{local_index}"])
+                    if critical is None:
+                        raise JevError(f"Missing identity probability for object {local_index}")
                     row = {
                         "object_name": state.get("object_name", ""),
                         "part_class": part["choice"] or "OTHER",
@@ -637,7 +690,7 @@ def resolve_object_semantics_batch(states: list[dict[str, Any]], batch_size: int
                         "material_class": material["choice"] or "OTHER",
                         "material_confidence": material["confidence"],
                         "identity_critical_probability": critical,
-                        "identity_critical": critical >= 0.5,
+                        "identity_critical": critical >= IDENTITY_PROTECT_THRESHOLD,
                         "backend": "JEV",
                         "model": data.get("model", DEFAULT_MODEL),
                         "part_id_rgb": state.get("part_id_rgb", []),
@@ -653,19 +706,27 @@ def resolve_object_semantics_batch(states: list[dict[str, Any]], batch_size: int
         for global_index, state, key in group:
             row = _local_object_semantics(state, error_text)
             results[global_index] = row
-            with _CACHE_LOCK:
-                _CACHE[key] = dict(row)
+            # Local-only mode is deterministic and safe to cache. A fallback caused
+            # by a transient Jev failure must not poison the cache after recovery.
+            if not _key():
+                with _CACHE_LOCK:
+                    _CACHE[key] = dict(row)
 
     return [row if row is not None else _local_object_semantics(states[index]) for index, row in enumerate(results)]
 
 
-def semantic_prompt_block(results: list[dict[str, Any]], part_manifest: dict[str, Any] | None = None) -> str:
+def semantic_prompt_block(
+    results: list[dict[str, Any]],
+    part_manifest: dict[str, Any] | None = None,
+    *,
+    preserve_identity: bool = True,
+) -> str:
     if not results:
         return ""
     manifest = part_manifest or {}
     has_jev = any(row.get("backend") == "JEV" for row in results)
     title = "TypeSafe/Jev Semantic Part Map" if has_jev else "Local Semantic Fallback Map"
-    critical = [row for row in results if row.get("identity_critical")]
+    critical = [row for row in results if preserve_identity and row.get("identity_critical")]
     confident = [row for row in results if float(row.get("part_confidence", 0.0)) >= SEMANTIC_CONFIDENCE_THRESHOLD]
     ordered = (critical + [row for row in confident if row not in critical])[:28]
     lines = []
@@ -675,10 +736,14 @@ def semantic_prompt_block(results: list[dict[str, Any]], part_manifest: dict[str
         rgb255 = []
         if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
             rgb255 = [max(0, min(255, int(round(float(value) * 255)))) for value in rgb[:3]]
-        marker = "IDENTITY_CRITICAL" if row.get("identity_critical") else ""
+        marker = "IDENTITY_CRITICAL" if preserve_identity and row.get("identity_critical") else ""
+        internal_id = f"PART_{int(row.get('part_id_index') or 0):03d}" if row.get("part_id_index") else "PART_UNMAPPED"
+        material_text = ""
+        if float(row.get("material_confidence", 0.0)) >= MATERIAL_CONFIDENCE_THRESHOLD:
+            material_text = f"; material={row.get('material_class','OTHER')}"
         lines.append(
-            f"- {name}: part={row.get('part_class','OTHER')}; material={row.get('material_class','OTHER')}; "
-            f"confidence={float(row.get('part_confidence',0.0)):.2f}; Part-ID RGB={rgb255 or 'n/a'}; {marker}".rstrip("; ")
+            f"- {internal_id}: part={row.get('part_class','OTHER')}{material_text}; "
+            f"part_confidence={float(row.get('part_confidence',0.0)):.2f}; Part-ID RGB={rgb255 or 'n/a'}; {marker}".rstrip("; ")
         )
     if not lines:
         return ""

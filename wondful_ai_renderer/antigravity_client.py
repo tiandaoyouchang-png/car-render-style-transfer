@@ -659,7 +659,7 @@ def generate_image(
     structure_note = ""
     if structure_control and structure_control.get("enabled"):
         packet_roles = list(structure_control.get("generation_reference_roles", []))
-        role_lines = [f"- Reference {idx}: Blender Structure Packet / {role}" for idx, role in enumerate(packet_roles, start=2)]
+        role_lines = [f"- Structure source role: {role}" for role in packet_roles]
         structure_note = f"""
 Blender Structure Lock {structure_control.get('packet_version', '2.x')}：
 - Camera Base 决定整张 Camera / Composition / Perspective。

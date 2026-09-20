@@ -184,7 +184,7 @@ def _draw_reference_group(layout, props, title, collection_attr, index_attr, kin
 
 
 class WONDFUL_PT_main(Panel):
-    bl_label = "Wondful AI 渲染器 · 3.1.1"
+    bl_label = "Wondful AI 渲染器 · 3.1.4"
     bl_idname = "WONDFUL_PT_main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -194,7 +194,7 @@ class WONDFUL_PT_main(Panel):
         layout = self.layout
         props = context.scene.wondful_ai
         prefs = _prefs(context)
-        busy = props.status in {"AUTHENTICATING", "POLISHING", "RENDERING", "REFRESHING_MODELS"}
+        busy = props.status in {"AUTHENTICATING", "CLASSIFYING", "POLISHING", "RENDERING", "REFRESHING_MODELS"}
 
         # ---- Provider / camera -------------------------------------------------
         top = layout.box()
@@ -239,6 +239,7 @@ class WONDFUL_PT_main(Panel):
             "POLISHING": "润色中",
             "RENDERING": "渲染中",
             "REFRESHING_MODELS": "读取模型中",
+            "CLASSIFYING": "参考图分类中",
             "SUCCESS": "完成",
             "ERROR": "任务错误",
         }.get(props.status, props.status)
@@ -354,7 +355,7 @@ class WONDFUL_PT_main(Panel):
         if opened:
             if total > 0 and not busy:
                 action_row = refs.row(align=True)
-                action_row.operator("wondful.auto_classify_references", text="Jev 智能分类", icon="LIGHT")
+                action_row.operator("wondful.auto_classify_references", text="Jev 语义整理", icon="LIGHT")
             if getattr(props, "jev_status_message", ""):
                 refs.label(text=props.jev_status_message[:110], icon="INFO")
             _draw_reference_group(refs, props, "产品造型", "product_images", "product_image_index", "PRODUCT", "ui_show_product_refs")
