@@ -123,6 +123,29 @@ class IdentityRepairMaskSizeTests(unittest.TestCase):
             self.assertEqual(self._read_png_size(out), (160, 90))
 
 
+depth_utils = load_package_module("depth_utils")
+
+
+class DepthWindowTests(unittest.TestCase):
+    def test_product_spans_full_range_despite_long_ground(self):
+        depth = np.full((40, 80), 1e10, dtype=np.float32)       # background sentinel
+        depth[20:, :] = np.linspace(4.0, 40.0, 80)[None, :]     # 40 m ground plane
+        depth[5:20, 20:60] = np.linspace(4.3, 9.0, 40)[None, :]  # the car
+        valid = depth < 1e9
+        product = np.zeros_like(valid); product[5:20, 20:60] = True
+        norm, near, far = depth_utils.normalize_depth(depth, valid, product)
+        car = norm[product]
+        self.assertGreater(car.max() - car.min(), 0.6)
+        self.assertLess(far, 15.0)
+        self.assertEqual(float(norm[0, 0]), 0.0)                 # background black
+
+    def test_no_product_falls_back_to_scene(self):
+        depth = np.linspace(1.0, 2.0, 100, dtype=np.float32).reshape(10, 10)
+        norm, near, far = depth_utils.normalize_depth(depth, np.ones_like(depth, bool), None)
+        self.assertAlmostEqual(near, 1.0, places=1)
+        self.assertGreater(norm.max() - norm.min(), 0.9)
+
+
 class StructurePacketSourceTests(unittest.TestCase):
     """Static guards for Blender 5.x compatibility (structure_packet imports bpy)."""
 

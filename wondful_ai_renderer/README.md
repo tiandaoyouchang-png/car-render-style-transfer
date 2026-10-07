@@ -36,7 +36,7 @@
 
 ## 验证与限制
 
-- 离线测试：`python -m unittest discover -s tests`（20 项），以及 `python tools/check_undefined_names.py`（捕获 NameError 类错误）。
+- 离线测试：`python -m unittest discover -s tests`（22 项），以及 `python tools/check_undefined_names.py`（捕获 NameError 类错误）。
 - Blender 实机验收：`blender -b --factory-startup --python tools/blender_acceptance.py -- --out /tmp/wondful_accept`。3.1.6 已在 Blender 4.3.2 与 5.1.2 上全部通过（无 GPU 环境用 `WONDFUL_STRUCTURE_ENGINE=CYCLES` 代替 EEVEE 渲染结构图）。
 - 真实 Codex / Antigravity 生图需要本机登录，未包含在自动验收中。
 

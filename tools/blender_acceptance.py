@@ -177,7 +177,7 @@ for mode in ("STANDARD", "FAST"):
             bpy.data.images.remove(depth_img)
         prod = d[np.load(pk["part_index_path"]) > 0]
         spread = float(np.percentile(prod, 95) - np.percentile(prod, 5))
-        assert spread > 0.05, f"product depth spread {spread:.3f} (flat depth map)"
+        assert spread > 0.4, f"product depth spread {spread:.3f} (flat depth map)"
         packets[mode] = pk
         return {"depth_near": pk["depth_near"], "depth_far": pk["depth_far"], "product_depth_spread": round(spread, 3),
                 "visible_parts": sorted(visible)}

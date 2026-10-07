@@ -397,19 +397,12 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
         # percentile window and turns the whole depth map white, so only real
         # geometry inside the camera clip range is normalized.
         finite = np.isfinite(depth) & (depth > 1e-6) & (depth < _depth_background_cutoff(camera))
-        if np.any(finite):
-            samples = depth[finite]
-            near = float(np.percentile(samples, 0.5))
-            far = float(np.percentile(samples, 99.5))
-            if not math.isfinite(near) or not math.isfinite(far) or far <= near + 1e-8:
-                near, far = float(samples.min()), float(samples.max())
-            if far <= near + 1e-8:
-                far = near + 1.0
-            depth_norm = np.zeros_like(depth, dtype=np.float32)
-            depth_norm[finite] = 1.0 - np.clip((depth[finite] - near) / (far - near), 0.0, 1.0)
-        else:
-            near, far = 0.0, 1.0
-            depth_norm = np.zeros_like(depth, dtype=np.float32)
+        # The window is fitted to the product (Object Index > 0) so the car's own
+        # surface relief spans the 0..1 range instead of a sliver of it.
+        from .depth_utils import normalize_depth
+        depth_norm, near, far = normalize_depth(depth, finite, index_values > 0)
+        scene_depth_range = ([float(depth[finite].min()), float(depth[finite].max())]
+                             if np.any(finite) else [0.0, 0.0])
 
         # Blender Normal pass is signed floating-point data.  Encode it as the
         # conventional RGB normal map without color-management transforms.
@@ -484,6 +477,8 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
             "packet_width": packet_w,
             "packet_height": packet_h,
             "depth_near": near,
+            "scene_depth_range": scene_depth_range,
+            "depth_window": "PRODUCT_FOCUSED",
             "depth_far": far,
             "mask_path": str(mask_path),
             "depth_path": str(depth_path),
