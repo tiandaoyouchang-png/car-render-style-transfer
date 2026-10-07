@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "Wondful AI 渲染器-测试版3.1.5 · Identity Preserve Mask",
+    "name": "Wondful AI 渲染器-测试版3.1.6 · Blender 5 Compatibility",
     "author": "Wondful AI",
-    "version": (3, 1, 5),
+    "version": (3, 1, 6),
     "blender": (4, 3, 0),
     "location": "3D Viewport > Sidebar > Wondful AI",
     "description": "Deterministic Geometry → Structure Packet → Generative Appearance；Camera Base + Mask/Depth/Normal/Silhouette/Part-ID + Jev Semantic Layer",

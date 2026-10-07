@@ -74,19 +74,44 @@ def _capture_framebuffer(window, region, filepath: str) -> bool:
         return False
 
 
+def _snapshot_image_format(settings) -> dict:
+    """Blender 5.x adds ``media_type``; EXR multilayer lives under MULTI_LAYER_IMAGE
+    and PNG cannot be assigned until media_type is IMAGE.  Save both so the user's
+    Output Properties are restored exactly."""
+    return {
+        "media_type": getattr(settings, "media_type", None),
+        "file_format": settings.file_format,
+    }
+
+
+def _set_png(settings) -> None:
+    if getattr(settings, "media_type", None) not in (None, "IMAGE"):
+        settings.media_type = "IMAGE"
+    settings.file_format = "PNG"
+
+
+def _restore_image_format(settings, snap: dict) -> None:
+    try:
+        if snap.get("media_type") is not None and getattr(settings, "media_type", None) != snap["media_type"]:
+            settings.media_type = snap["media_type"]
+        settings.file_format = snap["file_format"]
+    except Exception:
+        pass
+
+
 def _capture_opengl_view(context, window, area, region, filepath: str) -> bool:
     """Legacy active-view capture retained as a fallback utility."""
     scene = context.scene
     render = scene.render
     old_path = render.filepath
     old_x, old_y, old_pct = render.resolution_x, render.resolution_y, render.resolution_percentage
-    old_format = render.image_settings.file_format
+    old_format = _snapshot_image_format(render.image_settings)
     try:
         render.filepath = filepath
         render.resolution_x = max(1, int(region.width))
         render.resolution_y = max(1, int(region.height))
         render.resolution_percentage = 100
-        render.image_settings.file_format = "PNG"
+        _set_png(render.image_settings)
         with context.temp_override(window=window, area=area, region=region, scene=scene):
             result = bpy.ops.render.opengl(animation=False, sequencer=False, write_still=True, view_context=True)
         return "FINISHED" in result and Path(filepath).exists()
@@ -94,7 +119,7 @@ def _capture_opengl_view(context, window, area, region, filepath: str) -> bool:
         render.filepath = old_path
         render.resolution_x, render.resolution_y = old_x, old_y
         render.resolution_percentage = old_pct
-        render.image_settings.file_format = old_format
+        _restore_image_format(render.image_settings, old_format)
 
 
 def _capture_camera_opengl(context, filepath: str) -> bool:
@@ -113,7 +138,7 @@ def _capture_camera_opengl(context, filepath: str) -> bool:
     render = scene.render
     old_path = render.filepath
     old_x, old_y, old_pct = render.resolution_x, render.resolution_y, render.resolution_percentage
-    old_format = render.image_settings.file_format
+    old_format = _snapshot_image_format(render.image_settings)
     old_color_mode = getattr(render.image_settings, "color_mode", None)
     frame_options = {key: getattr(render, key) for key in ("use_border", "use_crop_to_border", "use_compositing", "use_sequencer", "use_multiview") if hasattr(render, key)}
     try:
@@ -123,7 +148,7 @@ def _capture_camera_opengl(context, filepath: str) -> bool:
         render.resolution_x = width
         render.resolution_y = height
         render.resolution_percentage = 100
-        render.image_settings.file_format = "PNG"
+        _set_png(render.image_settings)
         try:
             render.image_settings.color_mode = "RGB"
         except Exception:
@@ -136,7 +161,7 @@ def _capture_camera_opengl(context, filepath: str) -> bool:
         render.filepath = old_path
         render.resolution_x, render.resolution_y = old_x, old_y
         render.resolution_percentage = old_pct
-        render.image_settings.file_format = old_format
+        _restore_image_format(render.image_settings, old_format)
         for key, value in frame_options.items():
             setattr(render, key, value)
         if old_color_mode is not None:

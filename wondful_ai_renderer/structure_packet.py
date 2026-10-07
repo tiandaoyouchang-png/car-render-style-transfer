@@ -20,6 +20,7 @@ if Blender cannot render native data passes on the current scene.
 """
 
 import hashlib
+import os
 import json
 import math
 import shutil
@@ -120,20 +121,80 @@ def _id_color(name: str) -> tuple[float, float, float]:
     return tuple(0.18 + (raw[i] / 255.0) * 0.82 for i in range(3))
 
 
+# Render Layers socket names changed between Blender 4.x and 5.x
+# (e.g. "IndexOB" -> "Object Index").  Try every known alias.
+_PASS_SOCKET_ALIASES = {
+    "Depth": ("Depth", "Z"),
+    "Normal": ("Normal",),
+    "IndexOB": ("IndexOB", "Object Index"),
+}
+
+
+def _render_layer_socket(render_layers, socket_name: str):
+    for name in _PASS_SOCKET_ALIASES.get(socket_name, (socket_name,)):
+        socket = render_layers.outputs.get(name)
+        if socket is not None:
+            return socket
+    return None
+
+
+def _compositor_tree(temp_scene):
+    """Return (node_tree, owned_group) for the temp Scene compositor.
+
+    Blender <= 4.x: ``scene.use_nodes`` + ``scene.node_tree``.
+    Blender >= 5.0: the compositor is a node group assigned to
+    ``scene.compositing_node_group``; ``scene.node_tree`` no longer exists.
+    ``owned_group`` is the group we created and must remove afterwards.
+    """
+    if hasattr(temp_scene, "compositing_node_group"):
+        group = bpy.data.node_groups.new("Wondful_StructurePacket_Comp", "CompositorNodeTree")
+        temp_scene.compositing_node_group = group
+        return group, group
+    temp_scene.use_nodes = True
+    return temp_scene.node_tree, None
+
+
+def _set_exr_format(fmt, color_mode: str) -> None:
+    if hasattr(fmt, "media_type"):
+        try:
+            fmt.media_type = "IMAGE"
+        except Exception:
+            pass
+    fmt.file_format = "OPEN_EXR"
+    fmt.color_depth = "32"
+    for mode in (color_mode, "RGB", "RGBA", "BW"):
+        try:
+            fmt.color_mode = mode
+            return
+        except Exception:
+            continue
+
+
 def _file_output_node(nodes, links, render_layers, socket_name: str, base_path: Path, prefix: str, color_mode: str = "RGBA"):
-    socket = render_layers.outputs.get(socket_name)
+    socket = _render_layer_socket(render_layers, socket_name)
     if socket is None:
         return None
     node = nodes.new("CompositorNodeOutputFile")
-    node.base_path = str(base_path)
-    node.format.file_format = "OPEN_EXR"
-    node.format.color_depth = "32"
-    try:
-        node.format.color_mode = color_mode
-    except Exception:
-        pass
-    node.file_slots[0].path = prefix
-    links.new(socket, node.inputs[0])
+    _set_exr_format(node.format, color_mode)
+    if hasattr(node, "file_output_items"):
+        # Blender 5.x: directory + file_name + per-item name -> <dir>/<file_name><item>.exr
+        node.directory = str(base_path)
+        node.file_name = prefix
+        try:
+            node.file_output_items.clear()
+        except Exception:
+            pass
+        socket_type = "FLOAT" if color_mode == "BW" else ("VECTOR" if socket_name == "Normal" else "RGBA")
+        try:
+            node.file_output_items.new(socket_type, "pass")
+        except Exception:
+            node.file_output_items.new("RGBA", "pass")
+        target = node.inputs.get("pass") or node.inputs[0]
+    else:
+        node.base_path = str(base_path)
+        node.file_slots[0].path = prefix
+        target = node.inputs[0]
+    links.new(socket, target)
     return node
 
 
@@ -160,6 +221,43 @@ def _visible_scene_objects(context) -> list[bpy.types.Object]:
             pass
         result.append(obj)
     return result
+
+
+def _depth_background_cutoff(camera) -> float:
+    clip_end = 0.0
+    try:
+        clip_end = float(camera.data.clip_end)
+    except Exception:
+        clip_end = 0.0
+    if not math.isfinite(clip_end) or clip_end <= 0.0:
+        return 1e9
+    return min(1e9, clip_end * 0.999)
+
+
+def _structure_pass_engine(scene) -> str:
+    """EEVEE identifier differs by version: 4.2-4.x BLENDER_EEVEE_NEXT, 5.x BLENDER_EEVEE.
+
+    ``WONDFUL_STRUCTURE_ENGINE`` overrides it (used by headless CI without a GPU).
+    """
+    override = os.environ.get("WONDFUL_STRUCTURE_ENGINE", "").strip()
+    try:
+        available = {e.identifier for e in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items}
+    except Exception:
+        available = set()
+    for ident in ((override,) if override else ()) + ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
+        if ident and (not available or ident in available or ident == "CYCLES"):
+            return ident
+    return scene.render.engine
+
+
+def _configure_cycles_for_passes(temp_scene) -> None:
+    if temp_scene.render.engine != "CYCLES":
+        return
+    try:
+        temp_scene.cycles.samples = 1
+        temp_scene.cycles.use_denoising = False
+    except Exception:
+        pass
 
 
 def _native_data_passes(context, props, output_dir: Path, width: int, height: int, render_mode="STANDARD") -> dict:
@@ -194,6 +292,7 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
     temp_scene = bpy.data.scenes.new("Wondful_StructurePacket_" + uuid.uuid4().hex[:8])
     pass_index_snapshot: dict[str, tuple[bpy.types.Object, int]] = {}
     temp_files: list[Path] = []
+    owned_comp_group = None
     try:
         # Link the exact datablocks used by the working Scene so modifiers/materials,
         # camera lens and animation evaluate consistently, while keeping Scene settings isolated.
@@ -223,11 +322,10 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
         temp_scene.render.pixel_aspect_y = pixel_y
         temp_scene.render.film_transparent = True
         try:
-            temp_scene.render.engine = "BLENDER_EEVEE_NEXT"
+            temp_scene.render.engine = _structure_pass_engine(scene)
         except Exception:
-            # Use the original engine only if the current Blender build does not
-            # expose EEVEE Next under this identifier.
             temp_scene.render.engine = scene.render.engine
+        _configure_cycles_for_passes(temp_scene)
 
         view_layer = temp_scene.view_layers[0]
         view_layer.use_pass_z = True
@@ -252,9 +350,9 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
             obj.pass_index = idx
             part_index_to_name[idx] = obj.name
 
-        temp_scene.use_nodes = True
-        nodes = temp_scene.node_tree.nodes
-        links = temp_scene.node_tree.links
+        comp_tree, owned_comp_group = _compositor_tree(temp_scene)
+        nodes = comp_tree.nodes
+        links = comp_tree.links
         nodes.clear()
         render_layers = nodes.new("CompositorNodeRLayers")
         render_layers.scene = temp_scene
@@ -294,20 +392,17 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
 
         # EXR depth is camera distance.  Keep actual near/far in the manifest and
         # provide a model-friendly 0..1 PNG (near=white, far=black).
-        finite = np.isfinite(depth) & (depth > 1e-6) & (depth < 1e20)
-        if np.any(finite):
-            samples = depth[finite]
-            near = float(np.percentile(samples, 0.5))
-            far = float(np.percentile(samples, 99.5))
-            if not math.isfinite(near) or not math.isfinite(far) or far <= near + 1e-8:
-                near, far = float(samples.min()), float(samples.max())
-            if far <= near + 1e-8:
-                far = near + 1.0
-            depth_norm = np.zeros_like(depth, dtype=np.float32)
-            depth_norm[finite] = 1.0 - np.clip((depth[finite] - near) / (far - near), 0.0, 1.0)
-        else:
-            near, far = 0.0, 1.0
-            depth_norm = np.zeros_like(depth, dtype=np.float32)
+        # Background pixels carry a sentinel distance (Cycles/EEVEE write ~1e10,
+        # some builds write the camera clip_end).  Including them collapses the
+        # percentile window and turns the whole depth map white, so only real
+        # geometry inside the camera clip range is normalized.
+        finite = np.isfinite(depth) & (depth > 1e-6) & (depth < _depth_background_cutoff(camera))
+        # The window is fitted to the product (Object Index > 0) so the car's own
+        # surface relief spans the 0..1 range instead of a sliver of it.
+        from .depth_utils import normalize_depth
+        depth_norm, near, far = normalize_depth(depth, finite, index_values > 0)
+        scene_depth_range = ([float(depth[finite].min()), float(depth[finite].max())]
+                             if np.any(finite) else [0.0, 0.0])
 
         # Blender Normal pass is signed floating-point data.  Encode it as the
         # conventional RGB normal map without color-management transforms.
@@ -382,6 +477,8 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
             "packet_width": packet_w,
             "packet_height": packet_h,
             "depth_near": near,
+            "scene_depth_range": scene_depth_range,
+            "depth_window": "PRODUCT_FOCUSED",
             "depth_far": far,
             "mask_path": str(mask_path),
             "depth_path": str(depth_path),
@@ -411,6 +508,11 @@ def _native_data_passes(context, props, output_dir: Path, width: int, height: in
             bpy.data.scenes.remove(temp_scene)
         except Exception:
             pass
+        if owned_comp_group is not None:
+            try:
+                bpy.data.node_groups.remove(owned_comp_group)
+            except Exception:
+                pass
         for p in temp_files:
             try:
                 p.unlink(missing_ok=True)

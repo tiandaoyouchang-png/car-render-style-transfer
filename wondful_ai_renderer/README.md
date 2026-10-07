@@ -1,14 +1,11 @@
-# Wondful AI 渲染器 3.1.5
+# Wondful AI 渲染器 3.1.6
 
-> 3.1.5 新增 Identity Preserve Mask：把 Logo、字标、车牌文字和可读 UI 从 Prompt 保护升级为实际图像编辑 Mask；Standard/Strict 使用全分辨率 Part Index，严格纠偏时也保持身份区域不可编辑。详见 `CHANGELOG_3.1.5.md`。
-
-
-基于 3.1.0 源码的修复版。处理参考图超限、AGY 登录入口、具体模型选择、长提示词阅读，以及 AGY 生图工具调用与位图回收问题。
+> 3.1.6 是稳定性版本，不改变工作流：修复 Blender 5.x 下原生结构图（Depth / Normal / Object Index）整体失效并退回投影方案的问题，使 3.1.5 的 Identity Preserve Mask 在 Blender 5.x 上真正生效；修复 Depth 图被背景拉成全白；修复 Antigravity 成功生图后报 NameError；修复严格纠偏时身份 Mask 与底图尺寸不一致。详见仓库 `CHANGELOG.md`。
 
 ## 安装与使用
 
-1. 保存当前 `.blend`，退出 Blender。重新打开后，在偏好设置中停用旧插件，通过“从磁盘安装”安装 `Wondful-AI-Renderer-Blender-3.1.1.zip`，然后启用。必要时再重启一次 Blender。
-2. 确认面板显示 **3.1.1**。`Source.zip` 是源码包，不用于直接安装。
+1. 保存当前 `.blend`，退出 Blender。重新打开后，在偏好设置中停用旧插件，通过“从磁盘安装”安装 `Wondful-AI-Renderer-Blender-3.1.6.zip`，然后启用。必要时再重启一次 Blender。
+2. 确认面板显示 **3.1.6**。`Source.zip` 是源码包，不用于直接安装。
 3. 选择 Codex 或 Antigravity，点击模型框旁的“刷新”。列表来自当前电脑上的官方 CLI；选择具体 ID 后，“当前选择”显示该值。没有列表时可以输入官方模型 ID；“默认”清除覆盖值。
 4. AGY 首次使用先点“Google 登录”，在官方终端完成初始化和浏览器授权，再回插件点“验证登录”。验证使用当前选择的推理模型，并发起一次极短文本请求。
 5. 输入创意需求、设置参考图与说明，再点 AI 润色。需要阅读长文时点“展开全文”；“编辑完整提示词”打开支持中文、换行、滚动的 Text Editor，完成后点返回。AI 润色后仍可编辑同一份文本。
@@ -39,10 +36,10 @@
 
 ## 验证与限制
 
-144 项离线测试通过。覆盖参考容量、全部参考保留、修复轮次、错误分类、模型目录分页、模型参数传递、模拟 CLI 登录、长中文展开折叠与既有工作流。
-
-本次已在本机 Blender 5.1 安装目录完成 Python 编译、注册路径与回归检查，并用当前 AGY 1.1.27 Google Keychain 会话完成一次单图真实生图链路验证。Provider-specific 输出流程已做本地导出验证；正式结果仍需在你的场景中点击 AI 渲染。
+- 离线测试：`python -m unittest discover -s tests`（22 项），以及 `python tools/check_undefined_names.py`（捕获 NameError 类错误）。
+- Blender 实机验收：`blender -b --factory-startup --python tools/blender_acceptance.py -- --out /tmp/wondful_accept`。3.1.6 已在 Blender 4.3.2 与 5.1.2 上全部通过（无 GPU 环境用 `WONDFUL_STRUCTURE_ENGINE=CYCLES` 代替 EEVEE 渲染结构图）。
+- 真实 Codex / Antigravity 生图需要本机登录，未包含在自动验收中。
 
 图集解决的是输入容量。图集中各格会等比缩放，不能代替原生 ControlNet 或保证像素级对齐；白模底图本身不拼贴、不变形。画质和构图改善仍需同场景生图对比。
 
-详见 `CHANGELOG_3.1.1.md`、`RESEARCH_3.1.1.md`、`TEST_REPORT.md` 与 `BLENDER_ACCEPTANCE.md`。
+历史版本说明已移至仓库 `docs/history/`，不再随插件安装。
