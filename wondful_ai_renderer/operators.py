@@ -41,7 +41,7 @@ from .clipboard_utils import ClipboardImageError, save_clipboard_image
 from .config_manager import CONFIG_DIR, average_timing, record_timing
 from .composition import image_dimensions, assess_canvas, assess_audit, repair_region, write_repair_mask
 from .image_manager import compute_target_size, enforce_aspect_ratio, image_filepath, load_image, prepare_reference_for_upload
-from .prompt_engine import BASE_SYSTEM_PROMPT, STYLE_ANALYSIS_SYSTEM_PROMPT, build_polish_user_text, build_render_prompt, sanitize_appearance_prompt, needs_reference_policy_refresh, REFERENCE_POLICY_VERSION, select_polish_source
+from .prompt_engine import BASE_SYSTEM_PROMPT, STYLE_ANALYSIS_SYSTEM_PROMPT, build_polish_user_text, build_render_prompt, sanitize_appearance_prompt, sanitize_appearance_prompt_report, needs_reference_policy_refresh, REFERENCE_POLICY_VERSION, select_polish_source
 from .render_session import cleanup_old_sessions, copy_references, create_session, save_metadata
 from .output_manager import export_result, resolve_output_directory, preflight_output_directory
 from .viewport_capture import capture_camera_reference, camera_output_dimensions
@@ -188,6 +188,36 @@ def _get_prompt_text(props):
 def _set_prompt_text(props, text):
     # RNA callback also refreshes an open full-text editor.
     props.prompt = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _appearance_context(props):
+    """3.1.7: colour source, locked product look and identity checklist (main thread)."""
+    from . import appearance_lock
+    source = str(getattr(props, "color_source", "BLENDER") or "BLENDER")
+    material_text = ""
+    collection = getattr(props, "product_collection", None)
+    if source == "BLENDER" and collection is not None:
+        objects = []
+        for obj in getattr(collection, "all_objects", ()):
+            if getattr(obj, "type", "") != "MESH":
+                continue
+            try:
+                if not obj.visible_get():
+                    continue
+            except Exception:
+                pass
+            objects.append(obj)
+        try:
+            material_text = appearance_lock.material_summary(appearance_lock.collect_product_materials(objects))
+        except Exception:
+            material_text = ""
+    lock = appearance_lock.appearance_lock_block(source, material_text, getattr(props, "product_look_prompt", ""))
+    items = appearance_lock.identity_checklist(
+        _reference_instructions(props)["product"],
+        getattr(props, "jev_identity_assets", ""),
+        getattr(props, "identity_details", ""),
+    )
+    return source, lock, items
 
 
 def _reference_paths(props):
@@ -1136,6 +1166,9 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
         self._phase = "准备参考图"
 
 
+        color_source, appearance_lock_text, identity_items = _appearance_context(props)
+        self._appearance_meta = {"color_source": color_source, "appearance_lock": appearance_lock_text,
+                                 "identity_items": identity_items}
         user_text = build_polish_user_text(
             source_prompt, len(product), len(person), len(style), camera_w, camera_h,
             style_refresh=self._style_refresh_requested,
@@ -1143,6 +1176,9 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
             product_instructions=ref_instructions["product"],
             person_instructions=ref_instructions["person"],
             style_instructions=ref_instructions["style"],
+            color_source=color_source,
+            appearance_lock=appearance_lock_text,
+            identity_items=identity_items,
         )
 
         _status(props, "POLISHING")
@@ -1254,7 +1290,11 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
                 props.antigravity_account_state = "LOGGED_IN"
             else:
                 props.codex_account_state = "LOGGED_IN"
-            polished = sanitize_appearance_prompt(self._result or "")
+            polished, removed_fragments = sanitize_appearance_prompt_report(self._result or "")
+            props.prompt_removed_notice = (
+                "已移除构图类描述（由 Blender 控制）：" + "；".join(removed_fragments)[:240]
+                if removed_fragments else ""
+            )
             jev_meta = getattr(self, "_jev_appearance_meta", {}) or {}
             props.jev_status = str(jev_meta.get("backend", "") or props.jev_status or "LOCAL_FALLBACK")
             if jev_meta:
@@ -1317,6 +1357,7 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
                 {
                     "type": "prompt_polish",
                     "prompt_profile": self._prompt_profile,
+                    "appearance": getattr(self, "_appearance_meta", {}),
                     "style_cache_hit": self._style_cache_hit,
                     "engine": f"{getattr(self, '_provider_id', 'codex')}_oauth",
                     "analysis_provider": getattr(self, "_provider_id", "codex"),
@@ -1556,6 +1597,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
         self._render_mode = render_mode
         self._effective_long_edge = effective_long_edge
         self._target_w, self._target_h, target_size = compute_target_size(camera_w, camera_h, effective_long_edge)
+        color_source, appearance_lock_text, identity_items = _appearance_context(props)
+        if structure.get("enabled") and identity_items:
+            structure["identity_checklist"] = list(identity_items)
         render_prompt = build_render_prompt(
             current_prompt,
             camera_w,
@@ -1570,6 +1614,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
             product_instructions=ref_instructions["product"],
             person_instructions=ref_instructions["person"],
             style_instructions=ref_instructions["style"],
+            color_source=color_source,
+            appearance_lock=appearance_lock_text,
+            identity_items=identity_items,
         )
         render_prompt = prompt_profiles.render_brief(render_prompt, provider["id"])
         structure_refs = list(structure.get("generation_reference_paths", [])) if structure.get("enabled") else []

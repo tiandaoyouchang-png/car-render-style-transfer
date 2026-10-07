@@ -133,7 +133,13 @@ def _draw_reference_card(layout, props, item, index, kind):
         preview.label(text="图片无效", icon="ERROR")
 
     meta = split.column(align=True)
-    meta.label(text="主参考" if index == 0 else f"参考 {index + 1}", icon="CHECKMARK" if index == 0 else "IMAGE_DATA")
+    if kind == "STYLE":
+        primary_text = "主光来源"
+        icon0 = "LIGHT_SUN"
+    else:
+        primary_text = "主参考"
+        icon0 = "CHECKMARK"
+    meta.label(text=primary_text if index == 0 else f"辅助 {index + 1}", icon=icon0 if index == 0 else "IMAGE_DATA")
     if item.image:
         name = item.image.name
         meta.label(text=name if len(name) <= 24 else name[:21] + "…")
@@ -174,7 +180,7 @@ def _draw_reference_group(layout, props, title, collection_attr, index_attr, kin
     if not collection:
         empty = box.column(align=True)
         empty.label(text="拖入文件，或复制图片后点“粘贴”", icon="IMAGE_DATA")
-        empty.label(text="第一张自动作为主参考；每类最多 8 张。")
+        empty.label(text=("第一张决定主光，可用箭头调整顺序；每类最多 8 张。" if kind == "STYLE" else "第一张自动作为主参考；每类最多 8 张。"))
         return
 
     # The preview and its identity/controls now live in one card. There is no
@@ -337,6 +343,8 @@ class WONDFUL_PT_main(Panel):
         _draw_prompt_editor(prompt_box, props, columns)
         if props.prompt_notice:
             prompt_box.label(text=props.prompt_notice, icon="INFO")
+        if getattr(props, "prompt_removed_notice", ""):
+            prompt_box.label(text=props.prompt_removed_notice[:110], icon="TRASH")
 
         policy_stale = needs_reference_policy_refresh(props)
         target_stale = prompt_profiles.needs_target_refresh(props, prefs)
@@ -361,6 +369,23 @@ class WONDFUL_PT_main(Panel):
             _draw_reference_group(refs, props, "产品造型", "product_images", "product_image_index", "PRODUCT", "ui_show_product_refs")
             _draw_reference_group(refs, props, "人物", "person_images", "person_image_index", "PERSON", "ui_show_person_refs")
             _draw_reference_group(refs, props, "环境／风格", "style_images", "style_image_index", "STYLE", "ui_show_style_refs")
+
+        # 3.1.7: product appearance lock sits between references and polish.
+        lock_box = layout.box()
+        if _disclosure(lock_box.row(align=True), props, "ui_show_appearance_lock", "产品外观锁定", icon="LOCKED"):
+            lock_box.prop(props, "color_source", text="配色来源")
+            lock_box.prop(props, "product_look_prompt", text="产品外观")
+            lock_box.prop(props, "identity_details", text="保留细节")
+            hint = lock_box.column(align=True)
+            hint.scale_y = 0.8
+            hint.label(text="外观锁定原样进入生图指令；换环境只重写环境与光影。", icon="INFO")
+            if getattr(props, "jev_identity_assets", ""):
+                hint.label(text=("Jev 识别：" + props.jev_identity_assets)[:90], icon="LIGHT")
+        if getattr(props, "style_summary_cache", "") and len(props.style_images) > 0:
+            summary_box = layout.box()
+            if _disclosure(summary_box.row(align=True), props, "ui_show_style_summary", "环境分析（可编辑）", icon="LIGHT_SUN"):
+                summary_box.prop(props, "style_summary_cache", text="")
+                summary_box.label(text="修改后再点 AI 润色，会按修改后的分析重写提示词。", icon="INFO")
 
         # AI prompt generation comes after reference configuration in the workflow.
         polish = layout.row(align=True)

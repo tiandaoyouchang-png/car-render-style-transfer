@@ -898,6 +898,14 @@ def audit_alignment(
 ) -> dict:
     structure_control = structure_control or {}
     structure_enabled = bool(structure_control.get("enabled"))
+    identity_items = [str(x) for x in (structure_control.get("identity_checklist") or []) if str(x).strip()]
+    identity_check = ""
+    if identity_items:
+        identity_check = (
+            "\n另外逐项检查候选图是否清晰保留这些产品细节（不计入构图分数）："
+            + "、".join(identity_items)
+            + "。把缺失或明显变形的项写进 JSON 的 missing_details 数组，没有则为空数组。\n"
+        )
     bbox = structure_control.get("bbox_normalized", [])
     center = structure_control.get("center_normalized", [])
     wheels = structure_control.get("wheel_points_normalized", [])
@@ -915,7 +923,7 @@ Blender 精确投影目标（0~1 归一化坐标，原点左上）：
 Reference 1 = Blender Camera Reference（唯一正确的构图/机位/空间基准）。
 Reference 2 = AI 渲染候选图。
 Reference 3（若存在）= Blender 产品轮廓 / 投影参考。
-{numeric_targets}
+{numeric_targets}{identity_check}
 只评估“几何与摄影机对齐”，不要因为候选图材质、灯光、画质更好就给高分。重点比较：
 - 车辆/产品二维包围框中心位置、左右上下边界与占画面比例
 - 前轮和后轮轮心在画面中的位置
@@ -960,4 +968,12 @@ observed_bbox 必须独立观察 Reference 2 中主体可见边界，坐标以�
         score = 0
     data["overall_score"] = max(0, min(100, score))
     data["correction"] = str(data.get("correction", "")).strip()
+    missing = data.get("missing_details") or []
+    if not isinstance(missing, list):
+        missing = [str(missing)]
+    missing = [str(x).strip() for x in missing if str(x).strip()]
+    data["missing_details"] = missing
+    if missing:
+        fix = "补回并清晰呈现：" + "、".join(missing) + "。"
+        data["correction"] = (str(data.get("correction", "")).strip() + " " + fix).strip()
     return data

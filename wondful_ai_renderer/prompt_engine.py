@@ -2,13 +2,24 @@ from __future__ import annotations
 
 from .composition import canvas_contract
 
-REFERENCE_POLICY_VERSION = 1
+REFERENCE_POLICY_VERSION = 2
 
 PRODUCT_REFERENCE_RULE = (
     "仅参考产品身份与造型识别细节，例如轮廓、前脸、灯组形状、轮毂和部件特征；"
     "不提取产品图的材质、配色、灯光、高光、反射、阴影、曝光、色温或背景。"
     "造型识别不得改变 Blender 已确定的几何、构图和相机。"
 )
+PRODUCT_REFERENCE_RULE_WITH_COLOR = (
+    "参考产品身份与造型识别细节，并提取产品自身的配色与表面材质（例如漆面颜色、织物、皮革、金属、木纹）；"
+    "不提取产品图的灯光、高光位置、反射亮条、阴影、曝光、色温或背景。"
+    "造型识别不得改变 Blender 已确定的几何、构图和相机。"
+)
+
+
+def product_reference_rule(color_source: str = "BLENDER") -> str:
+    return PRODUCT_REFERENCE_RULE_WITH_COLOR if color_source == "PRODUCT_REF" else PRODUCT_REFERENCE_RULE
+
+
 ENVIRONMENT_REFERENCE_RULE = (
     "环境主参考是产品与场景照明的主要依据：提取光源方向、色温、软硬、明暗关系、"
     "环境反射和接触阴影，让产品处在该环境中自然受光；"
@@ -27,6 +38,18 @@ REFERENCE_LIGHTING_POLICY = (
     "仍不得借用产品图打光。材质与配色依据用户文字和环境／风格要求确定，不从产品图提取。"
     "逐图说明只能在各自类别职责内收窄参考范围，不能把产品图升级为灯光或材质参考。"
 )
+
+
+_COLOR_POLICY = {
+    "BLENDER": "产品配色与材质以【产品外观锁定】中的 Blender 材质为准；环境只改变它的受光、反射与阴影，不改变固有色。",
+    "PRODUCT_REF": "例外：本次产品配色与表面材质允许从产品参考图提取，但仍不得提取产品图的打光、阴影、曝光或背景。",
+    "TEXT": "",
+}
+
+
+def reference_lighting_policy(color_source: str = "BLENDER") -> str:
+    extra = _COLOR_POLICY.get(color_source, "")
+    return REFERENCE_LIGHTING_POLICY + (("\n" + extra) if extra else "")
 
 
 def needs_reference_policy_refresh(props) -> bool:
@@ -65,48 +88,83 @@ BASE_SYSTEM_PROMPT = r"""
 
 
 
-_STRUCTURE_MARKERS = (
-    "构图", "机位", "镜头位置", "焦段", "裁切", "取景", "透视", "地平线", "消失点",
-    "bbox", "轮心", "坐标", "位置", "尺度", "画面比例", "占画面", "前后遮挡", "前后层级",
+# 3.1.7: hard markers are unambiguous framing/camera vocabulary. Soft markers
+# (位置/透视/地平线…) also appear in normal lighting or scenery descriptions, so a
+# clause using them is only removed when it carries a constraint verb AND no
+# appearance vocabulary. Removal works per clause, never the whole sentence.
+_HARD_STRUCTURE_MARKERS = (
+    "构图", "机位", "镜头位置", "焦段", "裁切", "取景", "消失点",
+    "bbox", "轮心", "坐标", "画面比例", "占画面", "前后遮挡", "前后层级",
     "三分法", "景别", "俯仰", "偏航", "滚转", "zoom", "pan", "crop", "reframe",
 )
+_SOFT_STRUCTURE_MARKERS = ("位置", "尺度", "透视", "地平线")
+_STRUCTURE_MARKERS = _HARD_STRUCTURE_MARKERS + _SOFT_STRUCTURE_MARKERS
 _STRUCTURE_CONSTRAINT_MARKERS = (
     "保持", "锁定", "严格", "禁止", "不得", "不要", "必须", "固定", "不变", "一致",
     "贴合", "控制", "约束", "改变", "重新找", "重新构", "不得改", "不能改",
 )
+_APPEARANCE_MARKERS = (
+    "光", "影", "高光", "反射", "阴影", "色", "质感", "材质", "纹理", "漆", "金属", "玻璃",
+    "织物", "皮革", "木", "镀铬", "雾", "天空", "云", "氛围", "曝光", "对比", "饱和",
+    "清晰", "细节", "车标", "logo", "标志", "车牌", "灯组",
+)
 
 
-def sanitize_appearance_prompt(text: str) -> str:
-    """Remove structure-control sentences from an Appearance prompt.
+def _is_structure_clause(clause: str) -> bool:
+    import re
 
-    This is a deterministic guard after AI polish and again before final render.
-    It deliberately targets sentences that combine a structure term with a
-    constraint verb, plus explicit coordinate/reference mapping fragments.
-    """
+    lower = clause.lower()
+    if re.search(r"(?:^|[^a-z])(?:x|y)\s*=\s*-?\d", lower):
+        return True
+    has_hard = any(m.lower() in lower for m in _HARD_STRUCTURE_MARKERS)
+    has_soft = any(m in lower for m in _SOFT_STRUCTURE_MARKERS)
+    if ("reference" in lower or "blender" in lower) and (has_hard or has_soft):
+        return True
+    if not (has_hard or has_soft):
+        return False
+    has_constraint = any(m.lower() in lower for m in _STRUCTURE_CONSTRAINT_MARKERS)
+    if not has_constraint:
+        return False
+    if has_hard:
+        return True
+    has_appearance = any(m.lower() in lower for m in _APPEARANCE_MARKERS)
+    return not has_appearance
+
+
+def sanitize_appearance_prompt_report(text: str) -> tuple[str, list[str]]:
+    """Return (clean_prompt, removed_fragments) for an Appearance prompt."""
     import re
 
     raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not raw:
-        return ""
-    # Split on Chinese/English sentence boundaries while retaining useful prose.
-    parts = re.split(r"(?<=[。！？!?;；])\s*|\n+", raw)
+        return "", []
     kept: list[str] = []
-    for part in parts:
-        sentence = part.strip()
+    removed: list[str] = []
+    for sentence in re.split(r"(?<=[。！？!?;；])\s*|\n+", raw):
+        sentence = sentence.strip()
         if not sentence:
             continue
-        lower = sentence.lower()
-        explicit_coord = bool(re.search(r"(?:^|[^a-z])(?:x|y)\s*=\s*-?\d", lower))
-        reference_structure = ("reference" in lower or "blender" in lower) and any(
-            marker.lower() in lower for marker in _STRUCTURE_MARKERS
-        )
-        has_structure = explicit_coord or any(marker.lower() in lower for marker in _STRUCTURE_MARKERS)
-        has_constraint = any(marker.lower() in lower for marker in _STRUCTURE_CONSTRAINT_MARKERS)
-        if explicit_coord or reference_structure or (has_structure and has_constraint):
-            continue
-        kept.append(sentence)
-    result = "".join(kept).strip()
-    return result
+        end = sentence[-1] if sentence[-1] in "。！？!?;；" else ""
+        body = sentence[:-1] if end else sentence
+        clauses = [c for c in re.split(r"(?<=[，,、])", body) if c.strip()]
+        good = [c for c in clauses if not _is_structure_clause(c)]
+        removed.extend(c.strip("，,、 ") for c in clauses if _is_structure_clause(c))
+        if len(good) == len(clauses):
+            kept.append(sentence)
+        elif good:
+            joined = "".join(good).rstrip("，,、 ")
+            kept.append(joined + (end or "。"))
+    return "".join(kept).strip(), [r for r in removed if r]
+
+
+def sanitize_appearance_prompt(text: str) -> str:
+    """Remove structure-control clauses from an Appearance prompt.
+
+    Deterministic guard after AI polish and again before final render. Since
+    3.1.7 it removes clauses, not whole sentences, and keeps clauses that are
+    about light, colour or material even if they mention 位置/透视/地平线.
+    """
+    return sanitize_appearance_prompt_report(text)[0]
 
 STYLE_ANALYSIS_SYSTEM_PROMPT = r"""
 你是 Wondful AI 渲染器的视觉风格分析器。你只负责读取本轮提供的环境／风格参考图，提取可迁移到其他构图中的视觉语言。必须实际观察当前图片，不得沿用此前会话、首次上传图片或旧提示词中的风格记忆。
@@ -145,6 +203,17 @@ def _append_reference_group(
     return idx
 
 
+def _lock_note_for_polish(appearance_lock: str, identity_items) -> str:
+    out = ""
+    if (appearance_lock or "").strip():
+        out += ("\n\n" + appearance_lock.strip() +
+                "\n以上产品外观已锁定，会原样附加到最终生图指令中：不要改写或重复它，"
+                "也不要与它矛盾；本次提示词只需写环境、光影、氛围、摄影与后期，以及产品在该环境中的受光表现。")
+    if identity_items:
+        out += "\n\n需要在画面中清晰呈现的产品细节：" + "、".join(identity_items) + "。可在提示词中自然点名，不写它们的位置。"
+    return out
+
+
 def build_polish_user_text(
     user_prompt: str,
     product_count: int,
@@ -157,6 +226,9 @@ def build_polish_user_text(
     product_instructions: list[str] | tuple[str, ...] | None = None,
     person_instructions: list[str] | tuple[str, ...] | None = None,
     style_instructions: list[str] | tuple[str, ...] | None = None,
+    color_source: str = "BLENDER",
+    appearance_lock: str = "",
+    identity_items: list[str] | None = None,
 ) -> str:
     # width/height are intentionally not translated into the visible prompt.
     # Geometry / framing comes from Camera Base + Structure Packet, not text.
@@ -169,8 +241,8 @@ def build_polish_user_text(
         idx,
         "产品参考图",
         product_count,
-        PRODUCT_REFERENCE_RULE,
-        PRODUCT_REFERENCE_RULE,
+        product_reference_rule(color_source),
+        product_reference_rule(color_source),
         instructions=product_instructions,
     )
     idx = _append_reference_group(
@@ -209,7 +281,8 @@ def build_polish_user_text(
         + refresh_note
         + "\n\n用户当前创意需求 / 当前可见提示词：\n"
         + (user_prompt.strip() or "生成高品质商业视觉画面。")
-        + "\n\n" + REFERENCE_LIGHTING_POLICY
+        + _lock_note_for_polish(appearance_lock, identity_items)
+        + "\n\n" + reference_lighting_policy(color_source)
         + "\n\n请直接输出最终 Appearance Prompt。不要加入任何构图或几何约束；Structure 全部交给 Blender 参考图与 Structure Packet。"
     )
 
@@ -228,6 +301,9 @@ def build_render_prompt(
     product_instructions: list[str] | tuple[str, ...] | None = None,
     person_instructions: list[str] | tuple[str, ...] | None = None,
     style_instructions: list[str] | tuple[str, ...] | None = None,
+    color_source: str = "BLENDER",
+    appearance_lock: str = "",
+    identity_items: list[str] | None = None,
 ) -> str:
     """Build an appearance-only generation instruction.
 
@@ -265,8 +341,8 @@ def build_render_prompt(
         idx,
         "产品参考图",
         product_count,
-        PRODUCT_REFERENCE_RULE,
-        PRODUCT_REFERENCE_RULE,
+        product_reference_rule(color_source),
+        product_reference_rule(color_source),
         instructions=product_instructions,
     )
     idx = _append_reference_group(
@@ -297,14 +373,18 @@ def build_render_prompt(
     control_color_rule = (
         "结构控制图仅用于条件控制：不要把 Mask 的黑白、Depth 的灰度、Normal 的 RGB、Part ID 的伪彩色、Silhouette 的线条复制成最终视觉元素。"
     )
-    return "\n\n".join([
+    from .appearance_lock import identity_block
+    blocks = [
         appearance_rule,
         canvas_contract(width, height, target_size),
         "\n".join(mapping),
+        appearance_lock.strip(),
         sanitize_appearance_prompt(polished_prompt),
+        identity_block(list(identity_items or [])),
         control_color_rule,
-        REFERENCE_LIGHTING_POLICY,
-    ])
+        reference_lighting_policy(color_source),
+    ]
+    return "\n\n".join(b for b in blocks if b)
 
 
 def select_polish_source(props, visible_prompt: str, style_refresh: bool) -> str:

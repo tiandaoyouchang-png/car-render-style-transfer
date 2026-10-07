@@ -364,7 +364,36 @@ class WONDFUL_AISettings(PropertyGroup):
     task_phase: StringProperty(default="", options={"SKIP_SAVE"})
     prompt_target_key: StringProperty(default="", options={"HIDDEN"})
     style_summary_cache_key: StringProperty(default="", options={"HIDDEN"})
-    style_summary_cache: StringProperty(default="", options={"HIDDEN"})
+    style_summary_cache: StringProperty(
+        name="环境分析",
+        description="AI 从当前环境／风格参考图读出的主光方向、色温、软硬与氛围。可直接修改，下次润色会用修改后的内容",
+        default="",
+    )
+    ui_show_style_summary: BoolProperty(name="环境分析结果", default=False)
+
+    # 3.1.7 product appearance lock
+    color_source: EnumProperty(
+        name="配色来源",
+        description="产品固有色与材质从哪里来；任何来源都不会采用产品照片的打光",
+        items=[
+            ("BLENDER", "Blender 材质", "读取产品集合的材质颜色、金属度、粗糙度，写入外观锁定"),
+            ("PRODUCT_REF", "产品参考图", "允许从产品参考图提取配色与表面材质（仍不取其打光）"),
+            ("TEXT", "仅文字", "旧行为：配色与材质只来自提示词文字"),
+        ],
+        default="BLENDER",
+    )
+    product_look_prompt: StringProperty(
+        name="产品外观",
+        description="锁定的产品质感描述，例如“厚清漆、长而柔的渐变高光”。换环境参考时不会被重写，所有场景一致",
+        default="",
+    )
+    identity_details: StringProperty(
+        name="必须保留的细节",
+        description="用逗号分隔，例如“车标，前车牌，日行灯”。会写进生图指令，并在验收时逐项检查",
+        default="",
+    )
+    prompt_removed_notice: StringProperty(default="", options={"SKIP_SAVE"})
+    ui_show_appearance_lock: BoolProperty(name="产品外观锁定", default=True)
 
     analysis_provider: EnumProperty(
         name="AI Provider",
