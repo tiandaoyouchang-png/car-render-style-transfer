@@ -31,11 +31,11 @@ English: an open-source Blender add-on that turns one camera setup into multiple
 
 ### 案例二：设计单椅 · 四种家居风格
 
-| Blender 底图 | 北欧客厅 | 侘寂茶室 |
+| Blender 白模 | Blender 底图 | 北欧客厅 |
 |---|---|---|
-| ![](docs/showcase/chair_base.jpg) | ![](docs/showcase/chair_nordic.jpg) | ![](docs/showcase/chair_wabi.jpg) |
-| **工业 Loft** | **地中海露台** | |
-| ![](docs/showcase/chair_loft.jpg) | ![](docs/showcase/chair_terrace.jpg) | |
+| ![](docs/showcase/chair_clay.jpg) | ![](docs/showcase/chair_base.jpg) | ![](docs/showcase/chair_nordic.jpg) |
+| **侘寂茶室** | **工业 Loft** | **地中海露台** |
+| ![](docs/showcase/chair_wabi.jpg) | ![](docs/showcase/chair_loft.jpg) | ![](docs/showcase/chair_terrace.jpg) |
 
 | 场景 | 轮廓 IoU | 外轮廓 ≤3 px | 底部偏差 |
 |---|---|---|---|
@@ -70,7 +70,8 @@ English: an open-source Blender add-on that turns one camera setup into multiple
 - **严格模式验收 + 纠偏**：每张候选图按比例、位置、轮廓检查，不合格自动用 Mask 局部修复重试。
 - **双 Provider**：Codex 每次独立生成 4 张，Antigravity 每次 2 张；模型列表来自本机官方 CLI，不做跨模型静默回退。
 - **参考图管理**：产品参考决定身份造型，环境参考决定受光、反射和氛围；超出容量的参考自动整理成带编号的图集。
-- **AI 润色提示词**：中文创意需求一键扩写成生图提示词，支持完整编辑器。
+- **AI 润色提示词**：给参考图即可，AI 先分析环境的主光、色温和氛围（结果可编辑），再写成完整提示词；也可输入中文创意需求一键扩写。
+- **产品外观锁定**（3.1.7）：配色与材质默认读取 Blender 材质；锁定的产品质感与“必须保留的细节”原样进入每个场景，换环境只重写环境与光影。
 - **Compare 对比视图**：底图与结果叠加对比，所有候选图写入输出目录。
 
 ## 工作原理
@@ -113,7 +114,8 @@ Blender 场景 + 相机 + 产品集合
 1. 把产品放进一个集合，设置好相机（建议 3/4 前侧、略低机位）。
 2. 在面板选择 Provider（Codex 或 Antigravity），点模型框旁的“刷新”选择推理模型。
    - Antigravity 首次使用：点“Google 登录”完成授权，再点“验证登录”。
-3. 输入创意需求（例如“雪地清晨，冷色调，厚清漆车漆质感”），可添加产品参考图和环境参考图，点 **AI 润色**。
+3. 添加产品造型参考和环境／风格参考（第一张环境图决定主光），在「产品外观锁定」里确认配色来源、填写需要保留的细节（如“车标，前车牌”）。创意需求可写一句（例如“雪地清晨，冷色调”）或留空，点 **AI 润色**。
+   - 提示词只写外观：场景、材质、灯光、色调、氛围。构图类句子会被自动移除（结构由 Blender 底图控制），被移除的内容会显示在提示词下方。
 4. 选择相机、产品集合与输出位置，点 **开始渲染**。
 5. 在预览中查看最佳结果，或用 Compare 与底图对比；所有候选图都在输出目录中。
 
