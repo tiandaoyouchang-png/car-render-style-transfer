@@ -1772,6 +1772,7 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                                     self._session.directory / f"repair_identity_mask_v{variant_index:02d}_a{attempt_index:02d}.png",
                                     identity_meta["mask_npy_path"],
                                     editable_region=region,
+                                    output_size=tuple(previous["canvas"].get("actual_size") or (camera_w, camera_h)),
                                 )
                                 repair_strategy = "UNION_MASK_PLUS_IDENTITY_PRESERVE"
                             else:

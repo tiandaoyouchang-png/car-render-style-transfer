@@ -715,6 +715,10 @@ Reference 1 之后若存在 Structure Packet 图片，它们按 Mask / Depth / N
     if model.strip():
         args += ["--model", model.strip()]
     tracker = ArtifactTracker(workdir, excluded)
+    # Conversation ids of the most recent AGY turn. Shared with
+    # accept_candidate_paths(); 3.1.2-3.1.5 referenced a name local to
+    # inspect_result() there, raising NameError after a successful image.
+    conversation_ids: list[str] = []
 
     def run_task(task_text: str) -> subprocess.CompletedProcess:
         invoke_args = list(args) + ["--prompt", task_text]
@@ -735,9 +739,10 @@ Reference 1 之后若存在 Structure Packet 图片，它们按 Mask / Depth / N
         candidates = [target, workdir / target.name]
         for obj in candidate_objects:
             candidates.extend(_collect_image_candidates(obj, workdir))
-        conversation_ids = _conversation_ids(events)
-        conversation_ids.extend(x for x in _conversation_ids(final_result) if x not in conversation_ids)
-        for conversation_id in conversation_ids:
+        turn_ids = _conversation_ids(events)
+        turn_ids.extend(x for x in _conversation_ids(final_result) if x not in turn_ids)
+        conversation_ids[:] = turn_ids
+        for conversation_id in turn_ids:
             for brain_root in brain_roots:
                 candidates.extend(_brain_image_candidates(conversation_id, brain_root, target.name))
         newest = tracker.newest()

@@ -1,4 +1,4 @@
-"""Identity-preservation helpers for Wondful 3.1.5.
+"""Identity-preservation helpers for Wondful 3.1.5+.
 
 The worker-safe path builds a spatial keep-mask from Blender's Object Index map
 and Jev semantic results. Optional hard pixel restore is main-thread only and is
@@ -81,14 +81,44 @@ def write_rgba_png(path: str | Path, rgba: np.ndarray) -> str:
     return str(target)
 
 
+def resize_mask_nearest(mask: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Nearest-neighbour resample of a boolean mask to (width, height).
+
+    Downscaling is conservative (max-pool style) so thin logo strokes survive.
+    """
+    mask = np.asarray(mask).astype(bool)
+    src_h, src_w = mask.shape
+    width, height = max(1, int(width)), max(1, int(height))
+    if (src_w, src_h) == (width, height):
+        return mask.copy()
+    ys = np.minimum(src_h - 1, ((np.arange(height) + 0.5) * src_h / height).astype(np.int64))
+    xs = np.minimum(src_w - 1, ((np.arange(width) + 0.5) * src_w / width).astype(np.int64))
+    out = mask[ys[:, None], xs[None, :]]
+    if width < src_w or height < src_h:
+        # Conservative downscale: any preserved source pixel marks its target
+        # pixel, so 1-2px logo strokes never fall between sample points.
+        yy, xx = np.nonzero(mask)
+        out[(yy * height) // src_h, (xx * width) // src_w] = True
+    return out
+
+
 def write_identity_edit_mask(
     path: str | Path,
     identity_mask_npy: str | Path,
     *,
     editable_region: tuple[float, float, float, float] | None = None,
+    output_size: tuple[int, int] | None = None,
 ) -> str:
-    """RGBA edit mask: alpha=0 editable, alpha=1 preserved; identity is always preserved."""
+    """RGBA edit mask: alpha=0 editable, alpha=1 preserved; identity is always preserved.
+
+    ``output_size`` (width, height) is the pixel grid of the image the mask will be
+    paired with.  A strict repair edits the *previous candidate*, whose size can
+    differ from the Camera Base grid the identity mask was rasterized on, so the
+    mask is resampled (nearest, conservative dilation) to that grid.
+    """
     identity = np.load(str(identity_mask_npy), allow_pickle=False).astype(bool)
+    if output_size is not None:
+        identity = resize_mask_nearest(identity, int(output_size[0]), int(output_size[1]))
     h, w = identity.shape
     editable = np.ones((h, w), dtype=bool)
     if editable_region is not None:
