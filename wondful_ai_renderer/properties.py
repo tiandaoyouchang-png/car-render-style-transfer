@@ -403,6 +403,19 @@ class WONDFUL_AISettings(PropertyGroup):
     product_look_auto: StringProperty(default="", options={"HIDDEN"})
     identity_details_auto: StringProperty(default="", options={"HIDDEN"})
     product_autofill_message: StringProperty(default="", options={"SKIP_SAVE"})
+    # 3.1.9 one-button flow
+    scene_brief: StringProperty(
+        name="画面需求",
+        description="一句话说想要的场景，例如“雪地清晨，冷色调”。可留空，只按环境参考图来",
+        default="",
+    )
+    scene_brief_used: StringProperty(default="", options={"HIDDEN"})
+    pending_generate: BoolProperty(default=False, options={"SKIP_SAVE"})
+    two_step: BoolProperty(
+        name="分两步",
+        description="打开后「生成」只写提示词，确认后再点「渲染」",
+        default=False,
+    )
     prompt_removed_notice: StringProperty(default="", options={"SKIP_SAVE"})
     ui_show_appearance_lock: BoolProperty(name="产品外观锁定", default=True)
 
@@ -645,8 +658,9 @@ class WONDFUL_AISettings(PropertyGroup):
     ui_show_references: BoolProperty(name="参考图", default=True)
     ui_show_product_refs: BoolProperty(name="产品参考图", default=True)
     ui_show_person_refs: BoolProperty(name="人物参考图", default=False)
-    ui_show_style_refs: BoolProperty(name="环境／风格参考图", default=False)
+    ui_show_style_refs: BoolProperty(name="环境／风格参考图", default=True)
     ui_show_advanced: BoolProperty(name="高级设置", default=False)
+    ui_show_prompt: BoolProperty(name="提示词", default=False)
     alignment_score: FloatProperty(name="构图对齐分数", default=-1.0, min=-1.0, max=100.0)
     alignment_message: StringProperty(name="构图对齐说明", default="")
     alignment_attempts: IntProperty(name="生成尝试次数", default=0, min=0, max=40)

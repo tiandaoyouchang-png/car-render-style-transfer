@@ -690,6 +690,86 @@ class WONDFUL_OT_autofill_product_look(_BaseAsyncOperator):
         return {"FINISHED"}
 
 
+def _schedule_operator(idname):
+    """Run a modal operator once the current one has released the task lock."""
+    module, name = idname.split(".")
+
+    def run():
+        if _ACTIVE_LOCK.locked():
+            return 0.3
+        wm = bpy.context.window_manager
+        for window in getattr(wm, "windows", []):
+            area = next((a for a in window.screen.areas if a.type == "VIEW_3D"), None)
+            if area is None:
+                continue
+            region = next((r for r in area.regions if r.type == "UI"), None) or area.regions[-1]
+            with bpy.context.temp_override(window=window, area=area, region=region):
+                getattr(getattr(bpy.ops, module), name)("INVOKE_DEFAULT")
+            return None
+        getattr(getattr(bpy.ops, module), name)()
+        return None
+
+    bpy.app.timers.register(run, first_interval=0.3)
+
+
+def generate_needs_polish(props, prefs):
+    """3.1.9: decide whether 「生成」 must (re)write the prompt before rendering."""
+    brief = (getattr(props, "scene_brief", "") or "").strip()
+    if not (props.prompt or "").strip():
+        return True
+    if brief != (getattr(props, "scene_brief_used", "") or "").strip():
+        return True
+    if needs_reference_policy_refresh(props) or prompt_profiles.needs_target_refresh(props, prefs):
+        return True
+    if (props.style_prompt_dirty
+            or int(props.prompt_style_revision) != int(props.style_reference_revision)
+            or (len(props.style_images) > 0 and not bool(props.style_sync_initialized))):
+        return True
+    key = _product_autofill_key(props, _analysis_provider(props, prefs))
+    return bool(key) and _product_autofill_needed(props, key)
+
+
+class WONDFUL_OT_generate(Operator):
+    """3.1.9 single entry point: polish when needed, then render."""
+    bl_idname = "wondful.generate"
+    bl_label = "生成"
+    bl_description = "自动完成：读产品图 → 分析环境 → 写提示词 → 渲染与验收"
+
+    @classmethod
+    def poll(cls, context):
+        return not _ACTIVE_LOCK.locked()
+
+    def invoke(self, context, event):
+        return self.execute(context)
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        brief = (props.scene_brief or "").strip()
+        if generate_needs_polish(props, prefs):
+            if brief != (props.scene_brief_used or "").strip() or not (props.prompt or "").strip():
+                # A new brief replaces the old prompt as the polish source.
+                props.prompt = brief
+                props.last_ai_prompt = ""
+            props.pending_generate = not props.two_step
+            try:
+                result = bpy.ops.wondful.polish_prompt("INVOKE_DEFAULT")
+            except RuntimeError as exc:
+                result = {"CANCELLED"}
+                message = str(exc).replace("Error: ", "").strip()
+                _status(props, "ERROR", message)
+            if "RUNNING_MODAL" not in result and "FINISHED" not in result:
+                props.pending_generate = False
+                return {"CANCELLED"}
+            return {"FINISHED"}
+        try:
+            result = bpy.ops.wondful.ai_render("INVOKE_DEFAULT")
+        except RuntimeError as exc:
+            _status(props, "ERROR", str(exc).replace("Error: ", "").strip())
+            return {"CANCELLED"}
+        return {"FINISHED"} if ("RUNNING_MODAL" in result or "FINISHED" in result) else {"CANCELLED"}
+
+
 class WONDFUL_OT_refresh_models(_BaseAsyncOperator):
     bl_idname = "wondful.refresh_models"
     bl_label = "刷新模型列表"
@@ -1472,6 +1552,7 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
                 elif isinstance(exc, CodexNotInstalledError):
                     props.codex_account_state = "NOT_INSTALLED"
                     props.codex_account_message = str(exc)
+                props.pending_generate = False
                 _status(props, "ERROR", str(exc))
                 props.progress = 0.0
                 self.report({"ERROR"}, str(exc))
@@ -1483,6 +1564,8 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
                 props.codex_account_state = "LOGGED_IN"
             if getattr(self, "_autofill_result", None):
                 _apply_product_autofill(props, self._autofill_key, *self._autofill_result)
+            chain_render = bool(getattr(props, "pending_generate", False))
+            props.pending_generate = False
             polished, removed_fragments = sanitize_appearance_prompt_report(self._result or "")
             props.prompt_removed_notice = (
                 "已移除构图类描述（由 Blender 控制）：" + "；".join(removed_fragments)[:240]
@@ -1569,10 +1652,13 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
                     "remote_audit_seconds": props.last_audit_seconds,
                 },
             )
+            props.scene_brief_used = (getattr(props, "scene_brief", "") or "").strip()
             if props.style_prompt_dirty:
                 self.report({"WARNING"}, "提示词已生成，但风格图在生成期间又发生变化；请再次重新生成提示词。")
             else:
                 self.report({"INFO"}, f"{getattr(self, '_provider_label', 'Codex')} 提示词生成完成，可以开始 AI 渲染。")
+                if chain_render and not getattr(props, "two_step", False):
+                    _schedule_operator("wondful.ai_render")
             return {"FINISHED"}
         return {"PASS_THROUGH"}
 

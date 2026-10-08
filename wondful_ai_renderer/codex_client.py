@@ -45,14 +45,72 @@ def _runtime_env(cli_path="") -> dict[str, str]:
     return runtime_env(cli_path)
 
 
+def _newest(paths):
+    """Newest existing match first (extension folders carry version numbers)."""
+    hits = [p for p in paths if p.is_file()]
+    try:
+        return sorted(hits, key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return hits
+
+
+def _codex_candidates() -> list[Path]:
+    """Places Codex lives when Blender's PATH does not include it (3.1.9).
+
+    Covers npm / nvm / volta / scoop installs, the Codex desktop app, and the
+    codex binary bundled inside the VS Code / Cursor / Windsurf ChatGPT extension.
+    """
+    home = Path.home()
+    system = platform.system()
+    candidates: list[Path] = []
+    ext_roots = [home / ".vscode/extensions", home / ".vscode-insiders/extensions",
+                 home / ".cursor/extensions", home / ".windsurf/extensions"]
+    if system == "Windows":
+        env = os.environ
+        appdata = Path(env.get("APPDATA", home / "AppData/Roaming"))
+        local = Path(env.get("LOCALAPPDATA", home / "AppData/Local"))
+        program_files = [Path(env.get(k)) for k in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432") if env.get(k)]
+        names = ("codex.cmd", "codex.exe", "codex.ps1")
+        dirs = [appdata / "npm", home / "scoop/shims", home / ".bun/bin", home / ".cargo/bin",
+                local / "Volta/bin", local / "pnpm", local / "Microsoft/WindowsApps",
+                local / "Programs/codex", local / "Programs/Codex", local / "OpenAI/Codex/bin"]
+        if env.get("NVM_SYMLINK"):
+            dirs.insert(0, Path(env["NVM_SYMLINK"]))
+        for pf in program_files:
+            dirs += [pf / "nodejs", pf / "Codex", pf / "OpenAI/Codex"]
+        for d in dirs:
+            candidates += [d / n for n in names if n != "codex.ps1"]
+        nvm_home = Path(env.get("NVM_HOME", appdata / "nvm"))
+        try:
+            candidates += _newest(nvm_home.glob("v*/codex.cmd"))
+        except OSError:
+            pass
+        for root in ext_roots:
+            try:
+                candidates += _newest(root.glob("openai.chatgpt-*/bin/windows-*/codex.exe"))
+            except OSError:
+                pass
+        for base in (local / "Programs", local):
+            try:
+                candidates += _newest(base.glob("*odex*/**/codex.exe"))
+            except OSError:
+                pass
+    else:
+        if system == "Darwin":
+            for apps in (Path("/Applications"), home / "Applications"):
+                candidates.extend([apps / "ChatGPT.app/Contents/Resources/codex",
+                                   apps / "Codex.app/Contents/Resources/codex",
+                                   apps / "Codex.app/Contents/MacOS/codex"])
+        for root in ext_roots:
+            try:
+                candidates += _newest(root.glob("openai.chatgpt-*/bin/*/codex"))
+            except OSError:
+                pass
+    return candidates
+
+
 def discover_codex_cli(explicit_path: str = "") -> str | None:
-    candidates = []
-    if platform.system() == "Darwin":
-        for apps in (Path("/Applications"), Path.home() / "Applications"):
-            candidates.extend([apps / "ChatGPT.app/Contents/Resources/codex",
-                               apps / "Codex.app/Contents/Resources/codex",
-                               apps / "Codex.app/Contents/MacOS/codex"])
-    return find_cli("codex", explicit_path, ("CODEX_CLI_PATH",), candidates)
+    return find_cli("codex", explicit_path, ("CODEX_CLI_PATH",), _codex_candidates())
 
 
 def _run(

@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.1.9 · Simple Flow（2026-10-08）
+
+### 变更
+- **面板改成四步**：① 连接（已登录时只剩一行绿勾）② 产品（产品集合 + 一张三视图）③ 场景（环境参考 + 一句话需求）④ 一个「生成」按钮。结果区只留预览、对比、打开文件夹、再来一张。
+- **一键生成**：「生成」自动判断要不要先读产品图、分析环境、重写提示词，再接着渲染和验收；需求、参考图或引擎没变时直接渲染。高级里可打开「分两步」，先看提示词再渲染。
+- **其余收进「高级」**：Provider 与模型、提示词全文与「只重写提示词」、产品外观锁定、环境分析、人物参考、Jev 整理、渲染模式、输出目录、上次渲染详情、诊断。功能都在，默认折叠。
+- **Codex 路径自动识别**：Blender 读不到终端 PATH 时，额外查找 npm、nvm-windows、Volta、Scoop、pnpm、Program Files\nodejs、WindowsApps 别名、Codex 桌面版，以及 VS Code / Cursor / Windsurf 里 ChatGPT 插件自带的 codex。找不到时面板提示去偏好设置填路径。
+
+### 工程
+- 新增 `tests/test_319_simple_flow.py`（3 项）；离线测试共 40 项通过。
+- Blender 4.3.2 实机：四步面板在“未安装 / 已登录 / 展开高级”三种状态下绘制正常；生成按钮的提示词判断、CLI 缺失时的报错与状态回收、VS Code 插件内 codex 识别均通过。
+
 ## 3.1.8 · Single Product Reference & Auto Appearance（2026-10-08）
 
 ### 变更

@@ -38,7 +38,7 @@ class ProductSingleTests(unittest.TestCase):
     def test_ui_hint_and_label(self):
         src = (PKG / "ui.py").read_text()
         self.assertIn("建议放三视图", src)
-        self.assertIn("3.1.8", src)
+        self.assertRegex(src, r"3\.1\.\d+")
         ast.parse(src)
 
 
