@@ -139,16 +139,20 @@ def _draw_reference_card(layout, props, item, index, kind):
     else:
         primary_text = "主参考"
         icon0 = "CHECKMARK"
-    meta.label(text=primary_text if index == 0 else f"辅助 {index + 1}", icon=icon0 if index == 0 else "IMAGE_DATA")
+    if kind == "PRODUCT" and index > 0:
+        meta.label(text="未使用（只用第一张）", icon="ERROR")
+    else:
+        meta.label(text=primary_text if index == 0 else f"辅助 {index + 1}", icon=icon0 if index == 0 else "IMAGE_DATA")
     if item.image:
         name = item.image.name
         meta.label(text=name if len(name) <= 24 else name[:21] + "…")
     meta.prop(item, "instruction", text="造型重点" if kind == "PRODUCT" else "参考什么")
     controls = meta.row(align=True)
-    up = controls.operator("wondful.move_reference", text="", icon="TRIA_UP")
-    up.ref_kind, up.direction, up.item_index = kind, "UP", index
-    down = controls.operator("wondful.move_reference", text="", icon="TRIA_DOWN")
-    down.ref_kind, down.direction, down.item_index = kind, "DOWN", index
+    if kind != "PRODUCT":
+        up = controls.operator("wondful.move_reference", text="", icon="TRIA_UP")
+        up.ref_kind, up.direction, up.item_index = kind, "UP", index
+        down = controls.operator("wondful.move_reference", text="", icon="TRIA_DOWN")
+        down.ref_kind, down.direction, down.item_index = kind, "DOWN", index
     replace = controls.operator("wondful.replace_reference", text="", icon="FILE_REFRESH")
     replace.ref_kind, replace.item_index = kind, index
     remove = controls.operator("wondful.clear_reference", text="", icon="X")
@@ -161,11 +165,12 @@ def _draw_reference_group(layout, props, title, collection_attr, index_attr, kin
     header = box.row(align=True)
     opened = _disclosure(header, props, open_attr, title, suffix=f"  {len(collection)}")
     header.separator()
-    add_text = "换图" if kind == "STYLE" and collection else "文件"
-    add_icon = "FILE_REFRESH" if kind == "STYLE" and collection else "ADD"
+    replaces = kind in {"STYLE", "PRODUCT"} and bool(collection)
+    add_text = "换图" if replaces else "文件"
+    add_icon = "FILE_REFRESH" if replaces else "ADD"
     add = header.operator("wondful.load_reference", text=add_text, icon=add_icon)
     add.ref_kind = kind
-    paste = header.operator("wondful.paste_reference", text=("替换粘贴" if kind == "STYLE" and collection else "粘贴"))
+    paste = header.operator("wondful.paste_reference", text=("替换粘贴" if replaces else "粘贴"))
     paste.ref_kind = kind
     if collection:
         clear_all = header.operator("wondful.clear_all_references", text="", icon="TRASH")
@@ -174,13 +179,19 @@ def _draw_reference_group(layout, props, title, collection_attr, index_attr, kin
         return
 
     if kind == "PRODUCT":
-        box.label(text="仅参考产品造型，不参考原图打光。", icon="INFO")
+        box.label(text="只用 1 张，建议放三视图（正/侧/后拼成一张）。", icon="INFO")
+        box.label(text="仅参考产品造型，不参考原图打光。")
     elif kind == "STYLE":
         box.label(text="决定产品受光、反射、阴影与环境氛围。", icon="LIGHT")
     if not collection:
         empty = box.column(align=True)
         empty.label(text="拖入文件，或复制图片后点“粘贴”", icon="IMAGE_DATA")
-        empty.label(text=("第一张决定主光，可用箭头调整顺序；每类最多 8 张。" if kind == "STYLE" else "第一张自动作为主参考；每类最多 8 张。"))
+        if kind == "STYLE":
+            empty.label(text="第一张决定主光，可用箭头调整顺序；最多 8 张。")
+        elif kind == "PRODUCT":
+            empty.label(text="只放 1 张；再上传会直接替换。")
+        else:
+            empty.label(text="第一张自动作为主参考；最多 8 张。")
         return
 
     # The preview and its identity/controls now live in one card. There is no
@@ -190,7 +201,7 @@ def _draw_reference_group(layout, props, title, collection_attr, index_attr, kin
 
 
 class WONDFUL_PT_main(Panel):
-    bl_label = "Wondful AI 渲染器 · 3.1.4"
+    bl_label = "Wondful AI 渲染器 · 3.1.8"
     bl_idname = "WONDFUL_PT_main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -376,8 +387,17 @@ class WONDFUL_PT_main(Panel):
             lock_box.prop(props, "color_source", text="配色来源")
             lock_box.prop(props, "product_look_prompt", text="产品外观")
             lock_box.prop(props, "identity_details", text="保留细节")
+            fill = lock_box.row(align=True)
+            fill.enabled = len(props.product_images) > 0
+            fill.operator("wondful.autofill_product_look", text="根据参考自动填写", icon="EYEDROPPER")
             hint = lock_box.column(align=True)
             hint.scale_y = 0.8
+            if getattr(props, "product_autofill_message", ""):
+                hint.label(text=props.product_autofill_message, icon="CHECKMARK")
+            elif len(props.product_images) > 0:
+                hint.label(text="留空即可：AI 润色时会根据产品参考图自动填写。", icon="INFO")
+            else:
+                hint.label(text="放一张产品参考图后，这两栏会自动填写。", icon="INFO")
             hint.label(text="外观锁定原样进入生图指令；换环境只重写环境与光影。", icon="INFO")
             if getattr(props, "jev_identity_assets", ""):
                 hint.label(text=("Jev 识别：" + props.jev_identity_assets)[:90], icon="LIGHT")

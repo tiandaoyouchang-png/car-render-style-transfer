@@ -41,12 +41,12 @@ from .clipboard_utils import ClipboardImageError, save_clipboard_image
 from .config_manager import CONFIG_DIR, average_timing, record_timing
 from .composition import image_dimensions, assess_canvas, assess_audit, repair_region, write_repair_mask
 from .image_manager import compute_target_size, enforce_aspect_ratio, image_filepath, load_image, prepare_reference_for_upload
-from .prompt_engine import BASE_SYSTEM_PROMPT, STYLE_ANALYSIS_SYSTEM_PROMPT, build_polish_user_text, build_render_prompt, sanitize_appearance_prompt, sanitize_appearance_prompt_report, needs_reference_policy_refresh, REFERENCE_POLICY_VERSION, select_polish_source
+from .prompt_engine import BASE_SYSTEM_PROMPT, STYLE_ANALYSIS_SYSTEM_PROMPT, PRODUCT_ANALYSIS_SYSTEM_PROMPT, product_analysis_user_text, parse_product_analysis, build_polish_user_text, build_render_prompt, sanitize_appearance_prompt, sanitize_appearance_prompt_report, needs_reference_policy_refresh, REFERENCE_POLICY_VERSION, select_polish_source
 from .render_session import cleanup_old_sessions, copy_references, create_session, save_metadata
 from .output_manager import export_result, resolve_output_directory, preflight_output_directory
 from .viewport_capture import capture_camera_reference, camera_output_dimensions
 from .structure_packet import build_structure_packet
-from .properties import MAX_REFERENCES_PER_KIND
+from .properties import MAX_REFERENCES_PER_KIND, MAX_PRODUCT_REFERENCES, reference_limit
 from . import prompt_profiles
 from .reference_bundle import MAX_ANTIGRAVITY_IMAGE_PATHS, MAX_IMAGE_PATHS, prepare_bundle
 from .model_catalog import discover_models
@@ -190,6 +190,72 @@ def _set_prompt_text(props, text):
     props.prompt = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
+def _product_autofill_key(props, provider):
+    paths = _reference_paths(props)["product"]
+    if not paths:
+        return ""
+    notes = _reference_instructions(props)["product"]
+    return "|".join([
+        _reference_fingerprint(paths),
+        (notes[0] if notes else ""),
+        str(getattr(props, "color_source", "BLENDER")),
+        str(provider.get("id", "")),
+    ])
+
+
+def _product_fields_untouched(props):
+    """True when both fields are empty or still hold the last automatic values."""
+    look = (getattr(props, "product_look_prompt", "") or "").strip()
+    details = (getattr(props, "identity_details", "") or "").strip()
+    return (look in {"", (props.product_look_auto or "").strip()}
+            and details in {"", (props.identity_details_auto or "").strip()})
+
+
+def _product_autofill_needed(props, key):
+    if not key or not _product_fields_untouched(props):
+        return False
+    return key != getattr(props, "product_autofill_key", "") or not (props.product_look_prompt or props.identity_details)
+
+
+def _apply_product_autofill(props, key, look, details):
+    """Write analyser output unless the user typed into the fields meanwhile."""
+    if not _product_fields_untouched(props):
+        props.product_autofill_message = "你已手动修改外观锁定，自动结果未覆盖。"
+        return False
+    details_text = "，".join(details)
+    props.product_look_prompt = look
+    props.identity_details = details_text
+    props.product_look_auto = look
+    props.identity_details_auto = details_text
+    props.product_autofill_key = key
+    props.product_autofill_message = "已根据产品参考图自动填写，可直接修改。"
+    return True
+
+
+def appearance_lock_material_text(props):
+    """Blender material summary for the appearance lock (main thread only)."""
+    from . import appearance_lock
+    if str(getattr(props, "color_source", "BLENDER") or "BLENDER") != "BLENDER":
+        return ""
+    collection = getattr(props, "product_collection", None)
+    if collection is None:
+        return ""
+    objects = []
+    for obj in getattr(collection, "all_objects", ()):
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        try:
+            if not obj.visible_get():
+                continue
+        except Exception:
+            pass
+        objects.append(obj)
+    try:
+        return appearance_lock.material_summary(appearance_lock.collect_product_materials(objects))
+    except Exception:
+        return ""
+
+
 def _appearance_context(props):
     """3.1.7: colour source, locked product look and identity checklist (main thread)."""
     from . import appearance_lock
@@ -232,7 +298,7 @@ def _reference_paths(props):
         return result
 
     return {
-        "product": paths(props.product_images),
+        "product": paths(props.product_images)[:MAX_PRODUCT_REFERENCES],
         "person": paths(props.person_images),
         "style": paths(props.style_images),
     }
@@ -251,7 +317,7 @@ def _reference_instructions(props):
         return result
 
     return {
-        "product": notes(props.product_images),
+        "product": notes(props.product_images)[:MAX_PRODUCT_REFERENCES],
         "person": notes(props.person_images),
         "style": notes(props.style_images),
     }
@@ -361,8 +427,8 @@ def _load_reference_image(filepath):
 
 def _append_reference_from_path(props, ref_kind, filepath):
     collection, index_attr = _collection_and_index(props, ref_kind)
-    if len(collection) >= MAX_REFERENCES_PER_KIND:
-        raise RuntimeError(f"每类参考图最多 {MAX_REFERENCES_PER_KIND} 张。")
+    if len(collection) >= reference_limit(ref_kind):
+        raise RuntimeError(f"每类参考图最多 {reference_limit(ref_kind)} 张。")
     image = _load_reference_image(filepath)
     item = collection.add()
     item.image = image
@@ -392,6 +458,22 @@ def _replace_style_set(props, filepaths):
     setattr(props, index_attr, 0)
     _mark_reference_changed(props, "STYLE")
     return len(loaded), failures
+
+
+def _replace_product_reference(props, filepath):
+    """3.1.8: the product-shape slot holds exactly one image; a new one replaces it.
+
+    The image is loaded first so a failed read never empties the slot."""
+    image = _load_reference_image(filepath)
+    collection, index_attr = _collection_and_index(props, "PRODUCT")
+    old_note = (getattr(collection[0], "instruction", "") or "") if len(collection) else ""
+    collection.clear()
+    item = collection.add()
+    item.image = image
+    item.source_path = str(filepath)
+    item.instruction = old_note
+    setattr(props, index_attr, 0)
+    return item
 
 
 class _BaseAsyncOperator(Operator):
@@ -531,6 +613,81 @@ class _BaseAsyncOperator(Operator):
             _status(self._origin_scene.wondful_ai, "ERROR", "任务窗口已关闭；后台请求结束后可重新操作。")
         except (ReferenceError, AttributeError):
             pass
+
+
+class WONDFUL_OT_autofill_product_look(_BaseAsyncOperator):
+    """3.1.8: read the product reference and fill 产品外观 / 保留细节 now."""
+    bl_idname = "wondful.autofill_product_look"
+    bl_label = "根据参考自动填写"
+    bl_description = "让 AI 看产品参考图，自动填写产品外观与保留细节；会覆盖这两栏当前内容"
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.wondful_ai
+        return not _ACTIVE_LOCK.locked() and len(props.product_images) > 0
+
+    def execute(self, context):
+        props = context.scene.wondful_ai
+        prefs = _addon_prefs(context)
+        provider = _analysis_provider(props, prefs)
+        paths = _reference_paths(props)["product"]
+        if not paths:
+            self.report({"WARNING"}, "请先放一张产品参考图。")
+            return {"CANCELLED"}
+        session = create_session()
+        upload = [prepare_reference_for_upload(p) for p in copy_references(paths[:1], session, "product_reference")]
+        note = (_reference_instructions(props)["product"] or [""])[0]
+        color_source = str(getattr(props, "color_source", "BLENDER") or "BLENDER")
+        self._key = _product_autofill_key(props, provider)
+        self._phase = "读取产品参考图外观"
+        self._estimated_total = average_timing(f"{provider['id']}_polish", 30.0)
+        _status(props, "POLISHING")
+        props.progress = 0.05
+        polish_fn, cli_path, model = provider["polish"], provider["cli_path"], provider["model"]
+        timeout = int(provider["polish_timeout"])
+
+        def job():
+            reply = polish_fn(
+                system_prompt=PRODUCT_ANALYSIS_SYSTEM_PROMPT,
+                user_text=product_analysis_user_text(color_source, note),
+                image_paths=upload,
+                cwd=str(session.directory),
+                explicit_path=cli_path,
+                model=model,
+                timeout=timeout,
+            )
+            return parse_product_analysis(reply)
+
+        if not self._start_thread(context, job):
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _modal(self, context, event):
+        props = self._origin_scene.wondful_ai
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if self._thread and self._thread.is_alive():
+            self._progress_update(props, 0.10, 0.90)
+            return {"RUNNING_MODAL"}
+        self._cleanup(context)
+        props.progress = 0.0
+        props.eta_seconds = 0
+        if self._error:
+            _status(props, "ERROR", f"自动填写失败：{self._error[0]}")
+            self.report({"ERROR"}, props.last_error)
+            return {"CANCELLED"}
+        look, details = self._result or ("", [])
+        if not look and not details:
+            _status(props, "ERROR", "AI 没有返回可用的外观描述，两栏保持原样。")
+            self.report({"WARNING"}, props.last_error)
+            return {"CANCELLED"}
+        # Explicit button: the user asked for a refill, so overwrite.
+        props.product_look_auto = props.product_look_prompt
+        props.identity_details_auto = props.identity_details
+        _apply_product_autofill(props, self._key, look, details)
+        _status(props, "IDLE")
+        self.report({"INFO"}, props.product_autofill_message)
+        return {"FINISHED"}
 
 
 class WONDFUL_OT_refresh_models(_BaseAsyncOperator):
@@ -965,7 +1122,7 @@ class WONDFUL_OT_auto_classify_references(_BaseAsyncOperator):
         capacity_preserved = 0
         for _confidence, idx, target_kind in sorted(migration_candidates, reverse=True):
             current_kind = staged[idx][0]
-            if counts[target_kind] >= MAX_REFERENCES_PER_KIND:
+            if counts[target_kind] >= reference_limit(target_kind):
                 capacity_preserved += 1
                 continue
             counts[current_kind] -= 1
@@ -973,7 +1130,7 @@ class WONDFUL_OT_auto_classify_references(_BaseAsyncOperator):
             staged[idx][1] = target_kind
             migrated += 1
 
-        if sum(counts.values()) != len(all_refs) or any(v > MAX_REFERENCES_PER_KIND for v in counts.values()):
+        if sum(counts.values()) != len(all_refs) or any(v > reference_limit(k) and k != "PRODUCT" for k, v in counts.items()):
             _status(props, "ERROR", "参考图容量校验失败，已保留原分类。")
             props.progress = 0.0
             return {"CANCELLED"}
@@ -1169,17 +1326,28 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
         color_source, appearance_lock_text, identity_items = _appearance_context(props)
         self._appearance_meta = {"color_source": color_source, "appearance_lock": appearance_lock_text,
                                  "identity_items": identity_items}
-        user_text = build_polish_user_text(
-            source_prompt, len(product), len(person), len(style), camera_w, camera_h,
-            style_refresh=self._style_refresh_requested,
-            include_camera=False,
-            product_instructions=ref_instructions["product"],
-            person_instructions=ref_instructions["person"],
-            style_instructions=ref_instructions["style"],
-            color_source=color_source,
-            appearance_lock=appearance_lock_text,
-            identity_items=identity_items,
-        )
+        # 3.1.8: fill 产品外观 / 保留细节 from the product reference when the user
+        # has not typed their own. The material summary is captured on the main thread.
+        self._autofill_key = _product_autofill_key(props, _analysis_provider(props, prefs))
+        self._autofill_needed = bool(product_upload) and _product_autofill_needed(props, self._autofill_key)
+        self._autofill_result = None
+        _material_text = appearance_lock_material_text(props) if self._autofill_needed else ""
+        _jev_assets = getattr(props, "jev_identity_assets", "")
+
+        def _build_user_text(lock_text, items):
+            return build_polish_user_text(
+                source_prompt, len(product), len(person), len(style), camera_w, camera_h,
+                style_refresh=self._style_refresh_requested,
+                include_camera=False,
+                product_instructions=ref_instructions["product"],
+                person_instructions=ref_instructions["person"],
+                style_instructions=ref_instructions["style"],
+                color_source=color_source,
+                appearance_lock=lock_text,
+                identity_items=items,
+            )
+
+        user_text = _build_user_text(appearance_lock_text, identity_items)
 
         _status(props, "POLISHING")
         props.progress = 0.05
@@ -1204,6 +1372,29 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
 
         def job():
             final_user_text = user_text
+            if self._autofill_needed:
+                self._phase = "读取产品参考图外观"
+                try:
+                    reply = polish_fn(
+                        system_prompt=PRODUCT_ANALYSIS_SYSTEM_PROMPT,
+                        user_text=product_analysis_user_text(color_source, (ref_instructions["product"] or [""])[0]),
+                        image_paths=product_upload[:1],
+                        cwd=str(self._session.directory),
+                        explicit_path=cli_path,
+                        model=model,
+                        timeout=int(provider["polish_timeout"]),
+                    )
+                    look, details = parse_product_analysis(reply)
+                except Exception:
+                    look, details = "", []
+                if look or details:
+                    self._autofill_result = (look, details)
+                    from . import appearance_lock as _al
+                    lock_text = _al.appearance_lock_block(color_source, _material_text, look)
+                    items = _al.identity_checklist(ref_instructions["product"], _jev_assets, "，".join(details))
+                    self._appearance_meta = {"color_source": color_source, "appearance_lock": lock_text,
+                                             "identity_items": items, "autofilled": True}
+                    final_user_text = _build_user_text(lock_text, items)
             # 3.1.3: Jev performs fast structured judgments about change scope,
             # identity preservation and appearance parameters before the heavier
             # provider polish. This does not replace Codex/AGY generation.
@@ -1290,6 +1481,8 @@ class WONDFUL_OT_polish_prompt(_BaseAsyncOperator):
                 props.antigravity_account_state = "LOGGED_IN"
             else:
                 props.codex_account_state = "LOGGED_IN"
+            if getattr(self, "_autofill_result", None):
+                _apply_product_autofill(props, self._autofill_key, *self._autofill_result)
             polished, removed_fragments = sanitize_appearance_prompt_report(self._result or "")
             props.prompt_removed_notice = (
                 "已移除构图类描述（由 Blender 控制）：" + "；".join(removed_fragments)[:240]
@@ -2282,6 +2475,18 @@ class WONDFUL_OT_load_reference(Operator, ImportHelper):
                 self.report({"INFO"}, f"已更换当前风格参考，共 {added} 张。")
             return {"FINISHED" if added else "CANCELLED"}
 
+        if self.ref_kind == "PRODUCT":
+            try:
+                _replace_product_reference(props, selected[0])
+            except Exception as exc:
+                self.report({"ERROR"}, f"产品参考图读取失败：{exc}")
+                return {"CANCELLED"}
+            if len(selected) > 1:
+                self.report({"WARNING"}, "产品造型参考只保留 1 张，已使用第一张。多个角度请拼成一张三视图。")
+            else:
+                self.report({"INFO"}, "已设置产品造型参考。")
+            return {"FINISHED"}
+
         capacity = MAX_REFERENCES_PER_KIND - len(collection)
         if capacity <= 0:
             self.report({"WARNING"}, f"每类参考图最多 {MAX_REFERENCES_PER_KIND} 张。")
@@ -2317,7 +2522,7 @@ class WONDFUL_OT_paste_reference(Operator):
     def execute(self, context):
         props = context.scene.wondful_ai
         collection, index_attr = _collection_and_index(props, self.ref_kind)
-        if self.ref_kind != "STYLE" and len(collection) >= MAX_REFERENCES_PER_KIND:
+        if self.ref_kind not in {"STYLE", "PRODUCT"} and len(collection) >= MAX_REFERENCES_PER_KIND:
             self.report({"WARNING"}, f"每类参考图最多 {MAX_REFERENCES_PER_KIND} 张。")
             return {"CANCELLED"}
         clipboard_dir = CONFIG_DIR / "clipboard"
@@ -2329,6 +2534,8 @@ class WONDFUL_OT_paste_reference(Operator):
                 added, failures = _replace_style_set(props, [path])
                 if not added:
                     raise RuntimeError(failures[0] if failures else "无法读取剪贴板风格图")
+            elif self.ref_kind == "PRODUCT":
+                _replace_product_reference(props, path)
             else:
                 _append_reference_from_path(props, self.ref_kind, path)
                 _mark_reference_changed(props, self.ref_kind)

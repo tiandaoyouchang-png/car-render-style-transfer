@@ -15,9 +15,15 @@ PRODUCT_REFERENCE_RULE_WITH_COLOR = (
     "造型识别不得改变 Blender 已确定的几何、构图和相机。"
 )
 
+THREE_VIEW_NOTE = (
+    "产品参考图可能是三视图（同一产品的正面／侧面／背面拼在一张图里）："
+    "把各分格当作同一个产品的不同角度来理解造型，不要把拼版、分格线、标注文字或多个产品画进结果。"
+)
+
 
 def product_reference_rule(color_source: str = "BLENDER") -> str:
-    return PRODUCT_REFERENCE_RULE_WITH_COLOR if color_source == "PRODUCT_REF" else PRODUCT_REFERENCE_RULE
+    base = PRODUCT_REFERENCE_RULE_WITH_COLOR if color_source == "PRODUCT_REF" else PRODUCT_REFERENCE_RULE
+    return base + THREE_VIEW_NOTE
 
 
 ENVIRONMENT_REFERENCE_RULE = (
@@ -175,6 +181,59 @@ STYLE_ANALYSIS_SYSTEM_PROMPT = r"""
 
 输出一段紧凑、明确、可直接嵌入最终图像生成提示词的中文风格摘要，不要解释分析过程。
 """.strip()
+
+
+PRODUCT_ANALYSIS_SYSTEM_PROMPT = r"""
+你是 Wondful AI 渲染器的产品外观分析器。只看本轮附带的产品参考图（可能是三视图：同一产品的多个角度拼在一张图里），
+为“产品外观锁定”写两项内容：
+1. appearance：产品表面质感，一句中文短语串，例如“厚清漆车漆，长而柔的渐变高光，哑光黑饰条，熏黑玻璃”。
+   描述材质与表面处理（光泽度、清漆、拉丝、磨砂、织物纹理等）。不写产品照片自己的打光、背景、阴影、曝光，也不写构图与相机。
+2. details：生成时绝对不能丢失或改形的身份细节，3 到 8 项名词短语，例如车标、前车牌、贯穿式日行灯、五辐轮毂、侧裙饰条。
+   只列图中确实可见的部件，不猜测。
+只输出一个 JSON 对象，不要任何解释：{"appearance": "...", "details": ["...", "..."]}
+""".strip()
+
+
+def product_analysis_user_text(color_source: str = "BLENDER", note: str = "") -> str:
+    if color_source == "PRODUCT_REF":
+        color = "本次配色来源是产品参考图：appearance 里要写出产品各部分的固有色（例如“珍珠白车身，黑色车顶”）。"
+    else:
+        color = "本次配色来源不是产品参考图：appearance 只写质感与表面处理，不写任何颜色。"
+    text = "请分析附带的产品参考图，填写产品外观锁定。" + color
+    if (note or "").strip():
+        text += "\n用户对这张图的造型重点说明：" + note.strip()
+    return text
+
+
+def parse_product_analysis(text: str) -> tuple[str, list[str]]:
+    """Parse the analyser reply into (appearance, details); tolerant of fences and prose."""
+    import json as _json
+    import re as _re
+    raw = (text or "").strip()
+    match = _re.search(r"\{.*\}", raw, _re.S)
+    look, details = "", []
+    if match:
+        try:
+            data = _json.loads(match.group(0))
+            look = str(data.get("appearance", "") or "").strip()
+            items = data.get("details", []) or []
+            if isinstance(items, str):
+                items = _re.split(r"[，,、;；\n]+", items)
+            details = [str(i).strip() for i in items if str(i).strip()]
+        except (ValueError, AttributeError):
+            pass
+    if not look and not details:
+        for line in raw.splitlines():
+            line = line.strip().lstrip("-*0123456789. ")
+            if _re.match(r"^(appearance|产品外观|外观)\s*[:：]", line, _re.I):
+                look = _re.split(r"[:：]", line, 1)[1].strip()
+            elif _re.match(r"^(details|保留细节|细节)\s*[:：]", line, _re.I):
+                details = [d.strip() for d in _re.split(r"[，,、;；]+", _re.split(r"[:：]", line, 1)[1]) if d.strip()]
+    seen, unique = set(), []
+    for d in details:
+        if d not in seen:
+            seen.add(d); unique.append(d)
+    return look[:300], unique[:8]
 
 
 def _append_reference_group(

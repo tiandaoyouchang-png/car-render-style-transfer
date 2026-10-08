@@ -7,6 +7,12 @@ from bpy.types import AddonPreferences, PropertyGroup
 
 
 MAX_REFERENCES_PER_KIND = 8
+# 3.1.8: the product-shape reference is a single image (ideally a three-view sheet).
+MAX_PRODUCT_REFERENCES = 1
+
+
+def reference_limit(kind):
+    return MAX_PRODUCT_REFERENCES if kind == "PRODUCT" else MAX_REFERENCES_PER_KIND
 
 
 _PROMPT_SYNCING = False
@@ -321,7 +327,7 @@ class WONDFUL_AddonPreferences(AddonPreferences):
         box.label(text="运行依赖")
         box.label(text="Codex：官方 Codex CLI + ChatGPT OAuth；Antigravity：官方 Antigravity CLI + Google OAuth。")
         box.label(text="统一 Provider：选择 Codex 时润色/验收/生图都走 Codex；选择 Antigravity 时全部走 Antigravity。")
-        box.label(text=f"参考图：产品造型 / 人物 / 环境风格每类最多 {MAX_REFERENCES_PER_KIND} 张。")
+        box.label(text=f"参考图：产品造型 1 张（建议三视图）；人物 / 环境风格每类最多 {MAX_REFERENCES_PER_KIND} 张。")
 
 
 class WONDFUL_PromptLine(PropertyGroup):
@@ -392,6 +398,11 @@ class WONDFUL_AISettings(PropertyGroup):
         description="用逗号分隔，例如“车标，前车牌，日行灯”。会写进生图指令，并在验收时逐项检查",
         default="",
     )
+    # 3.1.8: auto-fill of the two fields above from the product reference.
+    product_autofill_key: StringProperty(default="", options={"HIDDEN"})
+    product_look_auto: StringProperty(default="", options={"HIDDEN"})
+    identity_details_auto: StringProperty(default="", options={"HIDDEN"})
+    product_autofill_message: StringProperty(default="", options={"SKIP_SAVE"})
     prompt_removed_notice: StringProperty(default="", options={"SKIP_SAVE"})
     ui_show_appearance_lock: BoolProperty(name="产品外观锁定", default=True)
 

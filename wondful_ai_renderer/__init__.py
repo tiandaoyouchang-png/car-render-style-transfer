@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "Wondful AI 渲染器-测试版3.1.7 · Prompt & Appearance Lock",
+    "name": "Wondful AI 渲染器-测试版3.1.8 · Prompt & Appearance Lock",
     "author": "Wondful AI",
-    "version": (3, 1, 7),
+    "version": (3, 1, 8),
     "blender": (4, 3, 0),
     "location": "3D Viewport > Sidebar > Wondful AI",
     "description": "Deterministic Geometry → Structure Packet → Generative Appearance；Camera Base + Mask/Depth/Normal/Silhouette/Part-ID + Jev Semantic Layer",
@@ -56,6 +56,7 @@ from .operators import (
     WONDFUL_OT_replace_reference,
     WONDFUL_OT_cancel_task,
     WONDFUL_OT_auto_classify_references,
+    WONDFUL_OT_autofill_product_look,
     WONDFUL_OT_copy_conversation_id,
     reset_stale_task_status,
 )
@@ -87,6 +88,7 @@ CLASSES = (
     WONDFUL_OT_ai_render,
     WONDFUL_OT_cancel_task,
     WONDFUL_OT_auto_classify_references,
+    WONDFUL_OT_autofill_product_look,
     WONDFUL_OT_copy_conversation_id,
     WONDFUL_OT_load_reference,
     WONDFUL_OT_choose_output_directory,
