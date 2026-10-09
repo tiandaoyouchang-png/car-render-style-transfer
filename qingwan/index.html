@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Ccircle cx=%2716%27 cy=%2716%27 r=%2712%27 fill=%27%23ffdc91%27/%3E%3C/svg%3E"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#123f42"><title>晴湾 · 海边慢游</title>
+<link rel="stylesheet" href="hi3d-style.css">
+</head>
+<body>
+<canvas id="world" aria-label="沙滩探索游戏"></canvas>
+<header><div class="brand"><span class="sun">☀</span><div>晴湾<small>SUNLIT COVE</small></div></div><div class="top-actions"><span id="region">海风正好</span><button id="sound" title="切换声音">声音 · 开</button><button id="pause" title="暂停游戏">暂停</button></div></header>
+<section id="welcome" class="overlay"><div class="welcome-card"><div class="eyebrow">一小片海岸，一整个悠闲下午</div><h1>把脚步，<br>交给海风。</h1><p>穿过椰林，沿木栈道看海。<br>踢一脚沙滩球，跳上礁石，找一个喜欢的角落。</p><div class="rule"></div><div class="controls touch-only" style="grid-template-columns:1fr">左下摇杆 漫步 · 右侧滑动 环顾 · 跳 / 踢 按钮</div><div class="controls key-only"><span><kbd>W A S D</kbd> 漫步</span><span><kbd>鼠标</kbd> 环顾</span><span><kbd>空格</kbd> 二段跳</span><span><kbd>Shift</kbd> 奔跑</span><span><kbd>E</kbd> 踢球</span><span><kbd>Esc</kbd> 暂停</span></div><button id="start" class="primary" disabled>正在准备海湾…</button><div id="loading" role="status">载入场景</div><div class="small-note">电脑键鼠或手机触屏 · 自由探索，没有倒计时</div></div></section>
+<div id="crosshair" hidden>·</div>
+<aside id="info" hidden><span class="eyebrow">自由探索</span><strong id="place">椰影沙滩</strong><p id="hint">海岸就在眼前，随意走走吧。</p></aside>
+<div id="touch"><div id="joy"><div id="knob"></div></div><div id="look"></div><button class="tbtn" id="tkick">踢</button><button class="tbtn" id="tjump">跳</button></div>
+<div id="toast" role="status"></div>
+<footer><span>WASD 移动 <i>·</i> 空格 跳跃 <i>·</i> E 踢球</span><div><button id="reset-ball">找回沙滩球</button><button id="home">返回沙滩</button></div></footer>
+<div id="error" hidden><strong>海湾暂时未能载入</strong><p id="error-detail"></p><button onclick="location.reload()">重新加载</button></div>
+<script src="hi3d-data.js"></script>
+<script src="hi3d-bundle.js"></script>
+</body></html>
