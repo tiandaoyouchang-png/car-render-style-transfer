@@ -200,20 +200,187 @@ def _draw_reference_group(layout, props, title, collection_attr, index_attr, kin
         _draw_reference_card(box, props, item, index, kind)
 
 
+# ---------------------------------------------------------------------------
+# 3.2.0 five-step card layout helpers
+# ---------------------------------------------------------------------------
+
+STEP_NUMBERS = ("①", "②", "③", "④", "⑤")
+GENERATE_STAGES = ("读产品图", "分析环境", "写提示词", "渲染验收")
+BUSY_STATUSES = {"AUTHENTICATING", "CLASSIFYING", "POLISHING", "RENDERING", "REFRESHING_MODELS"}
+
+
+def _step_card(layout, number, title, *, done, ready=True):
+    """One step = one box. The number turns into a CHECKMARK once the step is done.
+
+    ``ready`` only greys the card (``active``); it never disables buttons, so
+    a user can always prepare a later step first.
+    """
+    card = layout.box()
+    card.active = bool(ready or done)
+    header = card.row(align=True)
+    title_col = header.row(align=True)
+    if done:
+        title_col.label(text=title, icon="CHECKMARK")
+    else:
+        title_col.label(text=f"{STEP_NUMBERS[number - 1]}  {title}")
+    tools = header.row(align=True)
+    tools.alignment = "RIGHT"
+    return card, tools
+
+
+def _fit(tools, units):
+    """Give the header's right-hand tools a fixed width so the step title never truncates first."""
+    try:
+        tools.ui_units_x = units
+    except AttributeError:
+        pass
+
+
+def _thumb_scale(context, fraction=1.0, lo=4.0, hi=16.0):
+    """template_icon scale is in units of ~20 UI pixels; fit the sidebar width."""
+    region = getattr(context, "region", None)
+    width = float(getattr(region, "width", 0) or 320)
+    ui_scale = float(getattr(getattr(context.preferences, "system", None), "ui_scale", 1.0) or 1.0)
+    usable = width / max(0.5, ui_scale) - 44.0
+    return max(lo, min(hi, usable * fraction / 20.0))
+
+
+def _draw_thumbnail(layout, image, scale):
+    """Large preview of an image datablock (works in Blender 4.x sidebars)."""
+    if image is None:
+        layout.label(text="图片无效", icon="ERROR")
+        return
+    try:
+        image.preview_ensure()
+    except Exception:
+        pass
+    row = layout.row()
+    row.alignment = "CENTER"
+    row.template_icon(icon_value=bpy.types.UILayout.icon(image), scale=scale)
+
+
+def _short(text, limit=26):
+    text = text or ""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _reference_header_tools(tools, collection, kind):
+    """Compact icon actions on the card header (only once images exist; the empty
+    state has its own big buttons). Product keeps one image, so its replace /
+    paste-replace / remove live on the image itself and the header stays clean."""
+    if not collection or kind == "PRODUCT":
+        return
+    _fit(tools, 3.3)
+    add = tools.operator("wondful.load_reference", text="", icon="ADD")
+    add.ref_kind = kind
+    paste = tools.operator("wondful.paste_reference", text="", icon="PASTEDOWN")
+    paste.ref_kind = kind
+    clear_all = tools.operator("wondful.clear_all_references", text="", icon="TRASH")
+    clear_all.ref_kind = kind
+
+
+def _draw_reference_empty(card, kind, hint_lines):
+    drop = card.box()
+    actions = drop.row(align=True)
+    actions.scale_y = 1.6
+    add = actions.operator("wondful.load_reference", text="选择图片", icon="FILEBROWSER")
+    add.ref_kind = kind
+    paste = actions.operator("wondful.paste_reference", text="粘贴", icon="PASTEDOWN")
+    paste.ref_kind = kind
+    hints = drop.column(align=True)
+    hints.scale_y = 0.85
+    for index, line in enumerate(hint_lines):
+        hints.label(text=line, icon="INFO" if index == 0 else "BLANK1")
+
+
+def _draw_item_controls(row, item, index, kind, *, movable):
+    if movable:
+        up = row.operator("wondful.move_reference", text="", icon="TRIA_UP")
+        up.ref_kind, up.direction, up.item_index = kind, "UP", index
+        down = row.operator("wondful.move_reference", text="", icon="TRIA_DOWN")
+        down.ref_kind, down.direction, down.item_index = kind, "DOWN", index
+    replace = row.operator("wondful.replace_reference", text="", icon="FILE_REFRESH")
+    replace.ref_kind, replace.item_index = kind, index
+    if kind == "PRODUCT":
+        # Product holds one image: pasting replaces it (operator behaviour).
+        paste = row.operator("wondful.paste_reference", text="", icon="PASTEDOWN")
+        paste.ref_kind = kind
+    remove = row.operator("wondful.clear_reference", text="", icon="X")
+    remove.ref_kind, remove.item_index = kind, index
+
+
+def _draw_instruction(layout, item, placeholder):
+    if _supports_placeholder():
+        layout.prop(item, "instruction", text="", icon="GREASEPENCIL", placeholder=placeholder)
+    else:
+        layout.prop(item, "instruction", text=placeholder)
+
+
+def _draw_primary_reference(card, context, item, index, kind, *, caption, caption_icon, placeholder, movable):
+    """First reference: a large centred thumbnail, caption + compact controls under it."""
+    _draw_thumbnail(card, item.image, _thumb_scale(context))
+    meta = card.row(align=True)
+    label = meta.row(align=True)
+    label.label(text=caption, icon=caption_icon)
+    controls = meta.row(align=True)
+    controls.alignment = "RIGHT"
+    _fit(controls, 4.4 if movable else (3.3 if kind == "PRODUCT" else 2.2))
+    _draw_item_controls(controls, item, index, kind, movable=movable)
+    _draw_instruction(card, item, placeholder)
+
+
+def _draw_secondary_reference(card, context, item, index, kind, *, caption, caption_icon, placeholder, movable):
+    """Further references: small thumbnail on the left, caption, controls and note on the right."""
+    sub = card.box()
+    row = sub.row()
+    thumb = row.column()
+    _draw_thumbnail(thumb, item.image, 2.6)
+    meta = row.column(align=True)
+    head = meta.row(align=True)
+    head.label(text=caption, icon=caption_icon)
+    controls = meta.row(align=True)
+    _draw_item_controls(controls, item, index, kind, movable=movable)
+    _draw_instruction(meta, item, placeholder)
+
+
+def _stage_index(props):
+    """Map the live task phase onto the four 「生成」 stages (display only)."""
+    if props.status == "RENDERING":
+        return 3
+    phase = getattr(props, "task_phase", "") or ""
+    if props.status == "POLISHING":
+        if "风格" in phase or "环境" in phase:
+            return 1
+        if "产品" in phase or "准备" in phase:
+            return 0
+        return 2
+    return -1
+
+
+def _draw_progress_bar(layout, props, text):
+    bar = layout.row(align=True)
+    factor = max(0.0, min(1.0, float(props.progress)))
+    if hasattr(bar, "progress"):
+        bar.progress(factor=factor, text=text, type="BAR")
+    else:
+        bar.enabled = False
+        bar.prop(props, "progress", text=text, slider=True)
+
+
 class WONDFUL_PT_main(Panel):
-    bl_label = "Wondful AI 渲染器 · 3.1.9"
+    bl_label = "Wondful AI 渲染器 · 3.2.0"
     bl_idname = "WONDFUL_PT_main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Wondful AI"
 
     def draw(self, context):
-        """3.1.9: four steps on top (连接 / 产品 / 场景 / 生成); everything else in 高级."""
+        """3.2.0: five step cards (连接 / 产品三视图 / 环境参考图 / 提示词 / 生成); the rest in 高级."""
         from .operators import generate_needs_polish
         layout = self.layout
         props = context.scene.wondful_ai
         prefs = _prefs(context)
-        busy = props.status in {"AUTHENTICATING", "CLASSIFYING", "POLISHING", "RENDERING", "REFRESHING_MODELS"}
+        busy = props.status in BUSY_STATUSES
 
         active_is_antigravity = props.analysis_provider == "ANTIGRAVITY"
         state = props.antigravity_account_state if active_is_antigravity else props.codex_account_state
@@ -224,35 +391,47 @@ class WONDFUL_PT_main(Panel):
         camera = context.scene.camera
         camera_w, camera_h = camera_output_dimensions(context)
 
+        imagegen_enabled = prefs.codex_imagegen_enabled if not active_is_antigravity else prefs.antigravity_imagegen_enabled
+        structure_ready = bool((not prefs.structure_guides_enabled) or (not prefs.strict_composition_lock) or props.product_collection)
+        needs_polish = generate_needs_polish(props, prefs)
+
+        connected = state == "LOGGED_IN"
+        has_product = len(props.product_images) > 0
+        has_style = len(props.style_images) > 0
+        prompt_ready = bool((props.prompt or "").strip()) and not needs_polish
+        can_generate = bool(not busy and connected and camera and structure_ready and imagegen_enabled)
+
         # ---- ① 连接 -------------------------------------------------------------
-        step1 = layout.box()
-        head = step1.row(align=True)
-        if state == "LOGGED_IN":
-            head.label(text=f"① 连接 · {provider_label} 已连接", icon="CHECKMARK")
+        step1, tools = _step_card(layout, 1, "连接", done=connected)
+        if connected:
+            _fit(tools, 4.6)
+            tools.label(text=("Google" if active_is_antigravity else "ChatGPT"))
+            tools.operator(refresh_op, text="", icon="FILE_REFRESH")
         else:
             account_text = {
-                "UNKNOWN": f"{provider_label} 未检测",
+                "UNKNOWN": "未检测",
                 "NOT_INSTALLED": f"找不到 {provider_label}",
-                "LOGGED_OUT": ("Google 未登录" if active_is_antigravity else "ChatGPT 未登录"),
-                "ERROR": f"{provider_label} 异常",
+                "LOGGED_OUT": "未登录",
+                "ERROR": "异常",
             }.get(state, state)
             if active_is_antigravity and props.status == "AUTHENTICATING":
-                account_text = "正在连接 Google"
-            head.label(text=f"① 连接 · {account_text}", icon="QUESTION" if state == "UNKNOWN" else "ERROR")
-            head.operator(refresh_op, text="检测", icon="FILE_REFRESH")
+                account_text = "正在连接"
+            _fit(tools, 6 if len(account_text) > 4 else 4)
+            tools.label(text=account_text, icon="QUESTION" if state == "UNKNOWN" else "ERROR")
+            tools.operator(refresh_op, text="", icon="FILE_REFRESH")
             connect = step1.row(align=True)
-            connect.scale_y = 1.2
+            connect.scale_y = 1.5
             connect.enabled = not busy
             if active_is_antigravity:
                 connect.operator("wondful.antigravity_terminal", text="Google 登录", icon="USER")
                 connect.operator("wondful.antigravity_login", text="验证登录", icon="CHECKMARK")
-                step1.label(text="终端和浏览器里登录完，回来点验证登录。")
+                step1.label(text="终端和浏览器里登录完，回来点验证登录。", icon="INFO")
             else:
                 connect.operator("wondful.codex_login", text="使用 ChatGPT 登录", icon="USER")
             if state == "NOT_INSTALLED":
-                step1.label(text="已装 Codex 仍找不到？在高级 › 插件偏好设置里填它的路径。", icon="INFO")
+                step1.label(text="已装 Codex 仍找不到？在高级 › 插件偏好设置里填路径。", icon="INFO")
             elif account_message:
-                step1.label(text=account_message[:90])
+                step1.label(text=_short(account_message, 60), icon="BLANK1")
         if props.status == "AUTHENTICATING":
             auth = step1.box()
             if active_is_antigravity:
@@ -267,85 +446,167 @@ class WONDFUL_PT_main(Panel):
             else:
                 auth.prop(props, "progress", text="等待浏览器授权", slider=True)
 
-        # ---- ② 产品 -------------------------------------------------------------
-        step2 = layout.box()
-        step2.label(text="② 产品", icon="OUTLINER_COLLECTION")
-        step2.prop(props, "product_collection", text="产品集合")
+        # ---- ② 产品三视图 -------------------------------------------------------
+        product_done = has_product and structure_ready
+        step2, tools = _step_card(layout, 2, "产品三视图", done=product_done, ready=connected)
+        _reference_header_tools(tools, props.product_images, "PRODUCT")
+        if not has_product:
+            _draw_reference_empty(step2, "PRODUCT", (
+                "放 1 张三视图（正 / 侧 / 后拼成一张）",
+                "只参考造型，不参考原图打光",
+            ))
+        else:
+            for index, item in enumerate(props.product_images):
+                if index == 0:
+                    _draw_primary_reference(step2, context, item, index, "PRODUCT",
+                                            caption="三视图", caption_icon="IMAGE_DATA",
+                                            placeholder="造型重点（可选）", movable=False)
+                else:
+                    extra = step2.row(align=True)
+                    extra.label(text=f"未使用 · {_short(item.image.name if item.image else '无效图片', 16)}", icon="ERROR")
+                    remove = extra.operator("wondful.clear_reference", text="", icon="X")
+                    remove.ref_kind, remove.item_index = "PRODUCT", index
+        if not props.product_collection:
+            step2.label(text="产品所在集合（锁定构图用）：" if not structure_ready else "产品所在集合：")
+        target = step2.row(align=True)
+        target.prop(props, "product_collection", text="", icon="OUTLINER_COLLECTION")
         if not camera:
             step2.label(text="场景里还没有活动相机", icon="ERROR")
-        _draw_reference_group(step2, props, "产品参考（三视图）", "product_images", "product_image_index", "PRODUCT", "ui_show_product_refs")
 
-        # ---- ③ 场景 -------------------------------------------------------------
-        step3 = layout.box()
-        step3.label(text="③ 场景", icon="WORLD")
-        _draw_reference_group(step3, props, "环境参考", "style_images", "style_image_index", "STYLE", "ui_show_style_refs")
-        step3.label(text="一句话需求（可留空）：")
-        step3.prop(props, "scene_brief", text="")
-
-        # ---- ④ 生成 -------------------------------------------------------------
-        imagegen_enabled = prefs.codex_imagegen_enabled if not active_is_antigravity else prefs.antigravity_imagegen_enabled
-        structure_ready = bool((not prefs.structure_guides_enabled) or (not prefs.strict_composition_lock) or props.product_collection)
-        needs_polish = generate_needs_polish(props, prefs)
-        if props.two_step:
-            go_text = "生成提示词" if needs_polish else "渲染"
+        # ---- ③ 环境参考图 -------------------------------------------------------
+        step3, tools = _step_card(layout, 3, "环境参考图", done=has_style, ready=connected and product_done)
+        _reference_header_tools(tools, props.style_images, "STYLE")
+        if not has_style:
+            _draw_reference_empty(step3, "STYLE", (
+                "决定受光、反射、阴影与氛围（可选）",
+                "第一张作为主光来源，最多 8 张",
+            ))
         else:
-            go_text = "生成"
-        go = layout.row(align=True)
-        go.scale_y = 1.6
-        if props.status in {"POLISHING", "RENDERING"}:
+            for index, item in enumerate(props.style_images):
+                if index == 0:
+                    _draw_primary_reference(step3, context, item, index, "STYLE",
+                                            caption="主光来源", caption_icon="LIGHT_SUN",
+                                            placeholder="参考什么（可选）", movable=len(props.style_images) > 1)
+                else:
+                    _draw_secondary_reference(step3, context, item, index, "STYLE",
+                                              caption=f"辅助 {index + 1}", caption_icon="IMAGE_DATA",
+                                              placeholder="参考什么", movable=True)
+
+        # ---- ④ 提示词 -----------------------------------------------------------
+        step4, tools = _step_card(layout, 4, "提示词", done=prompt_ready, ready=connected and product_done)
+        _fit(tools, 3)
+        tools.label(text=f"{_prompt_char_count(props.prompt)} 字")
+        brief = step4.row(align=True)
+        brief.scale_y = 1.25
+        if _supports_placeholder():
+            brief.prop(props, "scene_brief", text="", icon="GREASEPENCIL", placeholder="一句话需求（可留空）：雪地清晨，冷色调")
+        else:
+            step4.label(text="一句话需求（可留空）：")
+            brief = step4.row(align=True)
+            brief.scale_y = 1.25
+            brief.prop(props, "scene_brief", text="", icon="GREASEPENCIL")
+        status_row = step4.row(align=True)
+        status_row.scale_y = 0.85
+        if prompt_ready:
+            status_row.label(text="提示词已就绪，生成时直接使用", icon="CHECKMARK")
+        else:
+            status_row.label(text="点「生成」时自动读图并写提示词", icon="INFO")
+        prompt_box = step4.column()
+        if _disclosure(prompt_box.row(align=True), props, "ui_show_prompt", "查看 / 编辑完整提示词", icon="TEXT"):
+            region_width = getattr(getattr(context, "region", None), "width", 330)
+            ui_scale = getattr(getattr(context.preferences, "system", None), "ui_scale", 1.0)
+            columns = max(16, int((region_width / max(.5, ui_scale) - 65) / 7.5))
+            prompt_box.prop(props, "prompt_expanded", text="收起" if props.prompt_expanded else "展开全文", emboss=False)
+            _draw_prompt_editor(prompt_box, props, columns)
+            if props.prompt_notice:
+                prompt_box.label(text=props.prompt_notice[:100], icon="INFO")
+            if getattr(props, "prompt_removed_notice", ""):
+                prompt_box.label(text=props.prompt_removed_notice[:100], icon="TRASH")
+            polish = prompt_box.row(align=True)
+            polish.enabled = bool(not busy and connected)
+            polish.operator("wondful.polish_prompt", text="只重写提示词", icon="TEXT")
+
+        # ---- ⑤ 生成 -------------------------------------------------------------
+        result_done = bool(props.result_image) and not busy
+        step5, tools = _step_card(layout, 5, "生成", done=result_done, ready=can_generate or busy)
+        if props.two_step and not busy:
+            _fit(tools, 3)
+            tools.label(text="分两步")
+        generating = props.status in {"POLISHING", "RENDERING"}
+        if generating:
+            current = _stage_index(props)
+            stages = step5.column(align=True)
+            stages.scale_y = 0.8
+            for index, name in enumerate(GENERATE_STAGES):
+                icon = "CHECKMARK" if index < current else ("PLAY" if index == current else "RADIOBUT_OFF")
+                cell = stages.row(align=True)
+                cell.active = index <= current
+                cell.label(text=name + ("  ·  进行中" if index == current else ""), icon=icon)
             pct = max(0, min(100, int(round(float(props.progress) * 100))))
-            stage = "写提示词" if props.status == "POLISHING" else "渲染"
-            phase = getattr(props, "task_phase", "") or stage
-            go.enabled = False
-            text = f"{phase} · {pct}%"
-            if hasattr(go, "progress"):
-                go.progress(factor=max(0.0, min(1.0, float(props.progress))), text=text, type="BAR")
-            else:
-                go.prop(props, "progress", text=text, slider=True)
+            phase = getattr(props, "task_phase", "") or GENERATE_STAGES[max(0, current)]
+            step5.label(text=phase, icon="TIME")
+            bar = step5.column()
+            bar.scale_y = 1.4
+            _draw_progress_bar(bar, props, f"估算 {pct}%")
         else:
-            go.enabled = bool(not busy and state == "LOGGED_IN" and camera and structure_ready and imagegen_enabled)
+            if props.two_step:
+                go_text = "生成提示词" if needs_polish else "渲染"
+            else:
+                go_text = "生成"
+            go = step5.row(align=True)
+            go.scale_y = 2.0
+            go.enabled = can_generate
             go.operator("wondful.generate", text=go_text, icon="RENDER_STILL")
         if busy:
-            cancel_row = layout.row(align=True)
+            if props.status not in {"POLISHING", "RENDERING"}:
+                step5.label(text=_short(getattr(props, "task_phase", "") or "后台任务进行中", 40), icon="TIME")
+            cancel_row = step5.row(align=True)
+            cancel_row.scale_y = 1.2
             cancel_row.operator("wondful.cancel_task", text="取消", icon="CANCEL")
         else:
             next_step = (
-                "先完成 ① 连接" if state != "LOGGED_IN" else
+                "先完成 ① 连接" if not connected else
                 "先在场景里设置活动相机" if not camera else
-                "先选择产品集合" if not structure_ready else
+                "先在 ② 选择产品集合" if not structure_ready else
                 "ImageGen 已在偏好设置里关闭" if not imagegen_enabled else "")
             if next_step:
-                layout.label(text=next_step, icon="INFO")
+                step5.label(text=next_step, icon="INFO")
         if props.status == "ERROR" and props.last_error:
-            err = layout.box()
-            for line in wrap(props.last_error, width=42)[:6]:
-                err.label(text=line, icon="ERROR")
+            err = step5.box()
+            lines = wrap(props.last_error, width=42)[:6]
+            for index, line in enumerate(lines):
+                err.label(text=line, icon="ERROR" if index == 0 else "BLANK1")
             err.operator("wondful.copy_diagnostics", text="复制诊断信息", icon="COPYDOWN")
 
-        # ---- 结果 ---------------------------------------------------------------
+        # ---- 结果（属于 ⑤）------------------------------------------------------
         provider_variant_count = render_variant_count("antigravity" if active_is_antigravity else "codex")
         if props.result_image:
-            result_box = layout.box()
-            title = result_box.row(align=True)
+            result = step5.box()
+            title = result.row(align=True)
             title.label(text="结果", icon="IMAGE_DATA")
             if props.alignment_score >= 0:
-                icon = "CHECKMARK" if props.alignment_score >= prefs.alignment_threshold else "ERROR"
-                title.label(text=f"轮廓对齐 {props.alignment_score:.0f}", icon=icon)
-            result_box.template_ID_preview(props, "result_image", rows=4, cols=7)
-            actions = result_box.row(align=True)
+                ok = props.alignment_score >= prefs.alignment_threshold
+                score = title.row(align=True)
+                score.alignment = "RIGHT"
+                _fit(score, 3.6)
+                score.label(text=f"对齐 {props.alignment_score:.0f}", icon="CHECKMARK" if ok else "ERROR")
+            _draw_thumbnail(result, props.result_image, _thumb_scale(context, 1.0, hi=18.0))
+            exported_count = max(0, int(getattr(props, "variant_count", 0)))
+            if props.status == "RENDERING" and props.last_export_path:
+                result.label(text=f"已完成 {exported_count}/{provider_variant_count} 张，继续生成中", icon="TIME")
+            elif exported_count > 1:
+                result.label(text=f"共 {exported_count} 张，预览为最佳一张", icon="INFO")
+            again = result.row(align=True)
+            again.scale_y = 1.4
+            again.enabled = not busy
+            again.operator("wondful.ai_render", text="再来一张", icon="FILE_REFRESH")
+            actions = result.row(align=True)
             actions.scale_y = 1.2
             actions.operator("wondful.open_compare_workspace", text="对比", icon="ARROW_LEFTRIGHT")
             actions.operator("wondful.open_output_directory", text="打开文件夹", icon="FILE_FOLDER")
-            again = actions.row(align=True)
-            again.enabled = not busy
-            again.operator("wondful.ai_render", text="再来一张", icon="FILE_REFRESH")
-            exported_count = max(0, int(getattr(props, "variant_count", 0)))
-            if props.status == "RENDERING" and props.last_export_path:
-                result_box.label(text=f"已完成 {exported_count}/{provider_variant_count} 张，继续生成中", icon="TIME")
-            elif exported_count > 1:
-                result_box.label(text=f"共 {exported_count} 张，预览为最佳一张", icon="IMAGE_DATA")
 
         # ---- 高级 ---------------------------------------------------------------
+        layout.separator()
         advanced = layout.box()
         if not _disclosure(advanced.row(align=True), props, "ui_show_advanced", "高级", icon="PREFERENCES"):
             return
@@ -376,13 +637,13 @@ class WONDFUL_PT_main(Panel):
         ai.label(text="生图：" + ("AGY generate_image" if active_is_antigravity else "Codex ImageGen") + "（由 CLI 管理）")
         acct = ai.row(align=True)
         acct.operator(refresh_op, text="检测登录", icon="FILE_REFRESH")
-        if state == "LOGGED_IN" and not active_is_antigravity:
+        if connected and not active_is_antigravity:
             acct.operator("wondful.codex_logout", text="退出登录", icon="X")
         if active_is_antigravity:
             acct.operator("wondful.antigravity_terminal", text="Google 登录", icon="CONSOLE")
         if cli_version:
             ai.label(text=cli_version[:90])
-        if state == "LOGGED_IN" and account_message:
+        if connected and account_message:
             ai.label(text=account_message[:90])
 
         flow = adv.box()
@@ -401,34 +662,19 @@ class WONDFUL_PT_main(Panel):
         if not prefs.structure_guides_enabled:
             flow.label(text="结构控制图已在偏好设置中关闭", icon="ERROR")
 
-        prompt_box = adv.box()
-        if _disclosure(prompt_box.row(align=True), props, "ui_show_prompt", f"提示词 · {_prompt_char_count(props.prompt)} 字", icon="TEXT"):
-            region_width = getattr(getattr(context, "region", None), "width", 330)
-            ui_scale = getattr(getattr(context.preferences, "system", None), "ui_scale", 1.0)
-            columns = max(16, int((region_width / max(.5, ui_scale) - 65) / 7.5))
-            prompt_box.prop(props, "prompt_expanded", text="收起" if props.prompt_expanded else "展开全文", emboss=False)
-            _draw_prompt_editor(prompt_box, props, columns)
-            if props.prompt_notice:
-                prompt_box.label(text=props.prompt_notice[:100], icon="INFO")
-            if getattr(props, "prompt_removed_notice", ""):
-                prompt_box.label(text=props.prompt_removed_notice[:100], icon="TRASH")
-            polish = prompt_box.row(align=True)
-            polish.enabled = bool(not busy and state == "LOGGED_IN")
-            polish.operator("wondful.polish_prompt", text="只重写提示词", icon="TEXT")
-
         lock_box = adv.box()
         if _disclosure(lock_box.row(align=True), props, "ui_show_appearance_lock", "产品外观锁定（自动填写）", icon="LOCKED"):
             lock_box.prop(props, "color_source", text="配色来源")
             lock_box.prop(props, "product_look_prompt", text="产品外观")
             lock_box.prop(props, "identity_details", text="保留细节")
             fill = lock_box.row(align=True)
-            fill.enabled = len(props.product_images) > 0 and not busy
+            fill.enabled = has_product and not busy
             fill.operator("wondful.autofill_product_look", text="重新根据参考填写", icon="EYEDROPPER")
             if getattr(props, "product_autofill_message", ""):
                 lock_box.label(text=props.product_autofill_message, icon="CHECKMARK")
             else:
                 lock_box.label(text="留空即可，生成时会根据产品参考自动填写。", icon="INFO")
-        if getattr(props, "style_summary_cache", "") and len(props.style_images) > 0:
+        if getattr(props, "style_summary_cache", "") and has_style:
             summary_box = adv.box()
             if _disclosure(summary_box.row(align=True), props, "ui_show_style_summary", "环境分析（可编辑）", icon="LIGHT_SUN"):
                 summary_box.prop(props, "style_summary_cache", text="")
@@ -444,6 +690,7 @@ class WONDFUL_PT_main(Panel):
         if props.result_image:
             info = adv.box()
             info.label(text="上次渲染", icon="INFO")
+            info.template_ID_preview(props, "result_image", rows=4, cols=7)
             if props.last_export_path:
                 info.label(text=f"输出：{props.last_export_path[:100]}")
             if props.alignment_attempts:
@@ -461,3 +708,18 @@ class WONDFUL_PT_main(Panel):
         tools = adv.row(align=True)
         tools.operator("wondful.copy_diagnostics", text="复制诊断信息", icon="COPYDOWN")
         tools.operator("preferences.addon_show", text="插件偏好设置").module = __package__
+
+
+def _supports_placeholder():
+    """UILayout.prop gained ``placeholder`` in Blender 4.1+; feature-detect once."""
+    global _PLACEHOLDER_OK
+    if _PLACEHOLDER_OK is None:
+        try:
+            params = bpy.types.UILayout.bl_rna.functions["prop"].parameters
+            _PLACEHOLDER_OK = "placeholder" in params.keys()
+        except Exception:
+            _PLACEHOLDER_OK = False
+    return _PLACEHOLDER_OK
+
+
+_PLACEHOLDER_OK = None

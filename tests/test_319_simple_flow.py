@@ -9,7 +9,8 @@ PKG = Path(__file__).resolve().parents[1] / "wondful_ai_renderer"
 class SimpleFlowTests(unittest.TestCase):
     def test_panel_steps(self):
         src = (PKG / "ui.py").read_text()
-        for text in ("① 连接", "② 产品", "③ 场景", "wondful.generate", "\"高级\""):
+        # 3.2.0 replaced the four-step layout with five step cards (see test_320).
+        for text in ("\"连接\"", "\"产品三视图\"", "\"环境参考图\"", "wondful.generate", "\"高级\""):
             self.assertIn(text, src)
         ast.parse(src)
 
