@@ -52,7 +52,7 @@ def test_323_crest_ground_option_wired():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / "wondful_ai_renderer"
     props = (root / "properties.py").read_text(encoding="utf-8")
-    assert 'clay_ground: EnumProperty' in props and '"CREST", "坡顶"' in props
+    assert 'clay_ground: EnumProperty' in props and '"CREST", "山头"' in props
     assert 'clay_crest_angle: FloatProperty' in props
     ui = (root / "ui.py").read_text(encoding="utf-8")
     assert 'ground.prop(props, "clay_ground", expand=True)' in ui

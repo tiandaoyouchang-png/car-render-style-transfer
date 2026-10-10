@@ -297,35 +297,68 @@ def _user_ground(context, collection, product_pts):
     return None
 
 
-def _crest_mesh(name, center, up, forward, half_top, angle_deg, size=300.0):
-    """A ridge: flat top of length 2*half_top along ``forward``, falling away by ``angle_deg`` both ways,
-    with a short rounded shoulder so it reads like a real hilltop."""
-    import bmesh  # noqa: F401  (ensures bmesh is available in Blender)
-    from mathutils import Vector
+def _crest_mesh(name, center, up, forward, half_len, half_wid, angle_deg, size=300.0, segments=64):
+    """A hilltop mound: an elliptical flat top just larger than the product's footprint, then a
+    rounded shoulder and ground that falls away by ``angle_deg`` in every direction, so the
+    product reads as parked on the very top of a hill from any camera angle."""
     side = forward.cross(up).normalized()
     a = math.radians(angle_deg)
-    shoulder = half_top * 0.6
-    prof = []  # (distance along forward, drop below crest)
-    for t in (0.0, 0.25, 0.5, 0.75, 1.0):  # rounded shoulder from flat to full slope
-        d = half_top + shoulder * t
-        prof.append((d, math.tan(a) * shoulder * t * t / 2.0))
-    d0, h0 = prof[-1]
-    prof.append((d0 + size, h0 + math.tan(a) * size))
-    line = [(-d, -h) for d, h in reversed(prof)] + [(d, -h) for d, h in prof]
-    verts, faces = [], []
-    for d, h in line:
-        for w in (-size, size):
-            p = center + forward * d + up * h + side * w
+    shoulder = max(half_len, half_wid) * 0.5
+    offsets = [0.0]
+    drops = [0.0]
+    for t in (0.2, 0.4, 0.6, 0.8, 1.0):  # rounded shoulder: slope eases from 0 to angle
+        offsets.append(shoulder * t)
+        drops.append(math.tan(a) * shoulder * t * t / 2.0)
+    for e in (shoulder + 4.0, shoulder + 15.0, shoulder + 50.0, shoulder + size):
+        offsets.append(e)
+        drops.append(drops[5] + math.tan(a) * (e - shoulder))
+    verts = [tuple(center)]
+    ring_n = segments
+    for e, h in zip(offsets, drops):
+        for k in range(ring_n):
+            th = 2.0 * math.pi * k / ring_n
+            p = (center + forward * ((half_len + e) * math.cos(th)) + side * ((half_wid + e) * math.sin(th))
+                 - up * h)
             verts.append((p.x, p.y, p.z))
-    for i in range(len(line) - 1):
-        a0, a1, b0, b1 = 2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3
-        faces.append((a0, b0, b1, a1))
+    faces = []
+    for k in range(ring_n):
+        faces.append((0, 1 + k, 1 + (k + 1) % ring_n))
+    for r in range(len(offsets) - 1):
+        o0, o1 = 1 + r * ring_n, 1 + (r + 1) * ring_n
+        for k in range(ring_n):
+            k1 = (k + 1) % ring_n
+            faces.append((o0 + k, o1 + k, o1 + k1, o0 + k1))
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(verts, [], faces)
     mesh.update()
     for poly in mesh.polygons:
         poly.use_smooth = True
     return mesh
+
+
+def _clay_sky_gradient(tree, bg):
+    """Outdoor-style environment for paint reflections: dark ground below the horizon, a bright
+    horizon band and a deeper sky above, so the clear coat shows a real horizon line, sky
+    gradient and dark lower reflections instead of a flat, weightless gray."""
+    nodes, links = tree.nodes, tree.links
+    coord = nodes.new("ShaderNodeTexCoord")
+    sep = nodes.new("ShaderNodeSeparateXYZ")
+    ramp = nodes.new("ShaderNodeValToRGB")
+    links.new(coord.outputs["Generated"], sep.inputs[0])
+    remap = nodes.new("ShaderNodeMapRange")
+    remap.inputs["From Min"].default_value = -1.0
+    remap.inputs["From Max"].default_value = 1.0
+    links.new(sep.outputs["Z"], remap.inputs["Value"])
+    links.new(remap.outputs["Result"], ramp.inputs["Fac"])
+    # World "Generated" is the view direction; remap its Z from [-1, 1] to [0, 1].
+    els = ramp.color_ramp.elements
+    els[0].position, els[0].color = 0.0, (0.03, 0.03, 0.035, 1.0)
+    els[1].position, els[1].color = 1.0, (0.10, 0.18, 0.38, 1.0)
+    for pos, col in ((0.47, (0.10, 0.10, 0.11, 1.0)), (0.5, (1.2, 1.18, 1.12, 1.0)),
+                     (0.55, (0.6, 0.7, 0.85, 1.0)), (0.7, (0.25, 0.36, 0.58, 1.0))):
+        e = els.new(pos)
+        e.color = col
+    links.new(ramp.outputs["Color"], bg.inputs[0])
 
 
 def _product_forward(pts, up):
@@ -389,11 +422,19 @@ def render_clay_base(context, filepath: str, collection=None, ground="AUTO", cre
         if ground is not None:
             floor.hide_render = True  # the user's own terrain (ramp, curb, road) is the ground
         elif ground_mode == "CREST" and pts:
+            up = Vector((0.0, 0.0, 1.0))  # a hilltop is level: the product sits flat on the very top
             fwd, length = _product_forward(pts, up)
             low = min(pts, key=lambda p: p.dot(up))
             centre = sum(pts, Vector()) / len(pts)
             centre = centre - up * (centre.dot(up) - low.dot(up))
-            crest = _crest_mesh("_wondful_clay_floor", centre, up, fwd, length * 0.38, crest_angle)
+            side_ax = fwd.cross(up).normalized()
+            sproj = [p.dot(side_ax) for p in pts]
+            prod_width = max(sproj) - min(sproj)
+            fproj = [p.dot(fwd) for p in pts]
+            centre = centre + fwd * ((max(fproj) + min(fproj)) / 2.0 - centre.dot(fwd)) \
+                + side_ax * ((max(sproj) + min(sproj)) / 2.0 - centre.dot(side_ax))
+            crest = _crest_mesh("_wondful_clay_floor", centre, up, fwd, length * 0.5 + 0.3, prod_width * 0.5 + 0.3,
+                                crest_angle)
             old_mesh = floor.data
             floor.data = crest
             floor.rotation_mode = "QUATERNION"
@@ -406,13 +447,13 @@ def render_clay_base(context, filepath: str, collection=None, ground="AUTO", cre
         mat.use_nodes = True
         bsdf = mat.node_tree.nodes.get("Principled BSDF")
         if bsdf:
-            bsdf.inputs["Base Color"].default_value = (0.62, 0.62, 0.62, 1.0)
-            bsdf.inputs["Roughness"].default_value = 0.85
+            bsdf.inputs["Base Color"].default_value = (0.2, 0.2, 0.21, 1.0)
+            bsdf.inputs["Roughness"].default_value = 0.8
         mesh.materials.append(mat)
         scene.collection.objects.link(floor)
         created += [("obj", floor), ("mesh", mesh), ("mat", mat)]
         sun_data = bpy.data.lights.new("_wondful_clay_sun", type="SUN")
-        sun_data.energy = 3.5
+        sun_data.energy = 4.0
         try:
             sun_data.angle = 0.12
         except Exception:
@@ -421,16 +462,42 @@ def render_clay_base(context, filepath: str, collection=None, ground="AUTO", cre
         sun.rotation_euler = (0.85, 0.0, 0.75)
         scene.collection.objects.link(sun)
         created += [("obj", sun), ("light", sun_data)]
+        if pts:  # two long softbox strips: crisp highlight bands across the clear coat
+            from mathutils import Vector as _V
+            c = sum(pts, _V()) / len(pts)
+            span = max((p - c).length for p in pts)
+            for i, (off, rot, energy) in enumerate((((0.0, 0.0, 2.2), (0.0, 0.0, 0.6), 900.0),
+                                                     ((-1.6, 1.4, 0.9), (1.2, 0.0, -0.9), 500.0))):
+                ld = bpy.data.lights.new(f"_wondful_clay_strip{i}", type="AREA")
+                ld.shape = "RECTANGLE"
+                ld.size, ld.size_y = span * 2.2, span * 0.18
+                ld.energy = energy * (span / 2.5) ** 2
+                lo = bpy.data.objects.new(f"_wondful_clay_strip{i}", ld)
+                lo.location = c + _V(off) * span
+                lo.rotation_euler = rot
+                scene.collection.objects.link(lo)
+                created += [("obj", lo), ("light", ld)]
         world = bpy.data.worlds.new("_wondful_clay_world")
         world.use_nodes = True
         bg = world.node_tree.nodes.get("Background")
         if bg:
-            bg.inputs[0].default_value = (0.72, 0.74, 0.76, 1.0)
-            bg.inputs[1].default_value = 0.9
+            bg.inputs[1].default_value = 1.0
+            _clay_sky_gradient(world.node_tree, bg)
         scene.world = world
         created.append(("world", world))
         for k in frame_options:
             setattr(render, k, False)
+        vs = scene.view_settings
+        snap["cm"] = (vs.view_transform, vs.look, vs.exposure)
+        try:
+            vs.view_transform = "AgX"
+            vs.look = "AgX - Medium High Contrast"
+        except Exception:
+            try:
+                vs.view_transform = "Filmic"
+                vs.look = "Medium High Contrast"
+            except Exception:
+                pass
         if hasattr(render, "film_transparent"):
             render.film_transparent = False
         engine = os.environ.get("WONDFUL_CLAY_ENGINE", "").strip().upper()
@@ -458,6 +525,11 @@ def render_clay_base(context, filepath: str, collection=None, ground="AUTO", cre
         bpy.ops.render.render(write_still=True)
         return Path(filepath).exists() and image_dimensions(filepath) == (width, height)
     finally:
+        if "cm" in snap:
+            try:
+                scene.view_settings.view_transform, scene.view_settings.look, scene.view_settings.exposure = snap["cm"]
+            except Exception:
+                pass
         render.engine = snap["engine"]
         render.filepath = snap["filepath"]
         render.resolution_x, render.resolution_y, render.resolution_percentage = snap["x"], snap["y"], snap["pct"]

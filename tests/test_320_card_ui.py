@@ -42,7 +42,7 @@ class CardUITests(unittest.TestCase):
     def test_version(self):
         init = (PKG / "__init__.py").read_text()
         # Bumped with each release (3.2.2: env text lock).
-        self.assertIn('"version": (3, 2, 3)', init)
+        self.assertIn('"version": (3, 2, 4)', init)
         self.assertIn("3.2.2", self.src)
 
 
