@@ -645,6 +645,11 @@ class WONDFUL_PT_main(Panel):
             ai.prop(prefs, "codex_direct_edit", text="图像编辑直连：在白模画布上直接编辑（推荐）")
             if getattr(prefs, "codex_direct_edit", True):
                 ai.prop(prefs, "codex_direct_simple", text="简洁输入：只发带地面灯光的白模底图（推荐）")
+                if getattr(prefs, "codex_direct_simple", True):
+                    ground = ai.row(align=True)
+                    ground.prop(props, "clay_ground", expand=True)
+                    if getattr(props, "clay_ground", "AUTO") == "CREST":
+                        ground.prop(props, "clay_crest_angle", text="下坡°")
             ai.label(text=("生图：Codex 图像编辑（直连，失败自动改用 CLI）" if getattr(prefs, "codex_direct_edit", True)
                            else "生图：Codex ImageGen（由 CLI 管理）"))
         acct = ai.row(align=True)

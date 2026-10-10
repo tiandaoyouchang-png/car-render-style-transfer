@@ -419,6 +419,19 @@ class WONDFUL_AISettings(PropertyGroup):
     identity_details_auto: StringProperty(default="", options={"HIDDEN"})
     product_autofill_message: StringProperty(default="", options={"SKIP_SAVE"})
     # 3.1.9 one-button flow
+    clay_ground: EnumProperty(
+        name="地面",
+        description="白模底图的临时地面形状。场景里有你自己的地面/地形时始终用你的",
+        items=[
+            ("AUTO", "自动", "平地；车身倾斜时自动铺成同坡度的斜坡"),
+            ("CREST", "坡顶", "车停在坡顶：前后地面向下倾斜"),
+        ],
+        default="AUTO",
+    )
+    clay_crest_angle: FloatProperty(
+        name="坡顶下坡角度", description="坡顶两侧向下倾斜的角度", default=10.0, min=2.0, max=30.0,
+        subtype="NONE", unit="NONE",
+    )
     scene_brief: StringProperty(
         name="画面需求",
         description="一句话说想要的场景，例如“雪地清晨，冷色调”。可留空，只按环境参考图来",

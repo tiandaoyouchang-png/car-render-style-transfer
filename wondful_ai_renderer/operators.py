@@ -1981,7 +1981,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                 clay_path = str(Path(self._session.viewport_reference).parent / "01_clay_base.png")
                 try:
                     from .viewport_capture import render_clay_base
-                    if render_clay_base(context, clay_path, getattr(props, "product_collection", None)):
+                    if render_clay_base(context, clay_path, getattr(props, "product_collection", None),
+                                        ground=getattr(props, "clay_ground", "AUTO"),
+                                        crest_angle=float(getattr(props, "clay_crest_angle", 10.0))):
                         direct_simple_base = clay_path
                         direct_simple_brief = (getattr(props, "scene_brief", "") or "").strip()
                 except Exception as exc:

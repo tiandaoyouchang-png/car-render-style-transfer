@@ -297,7 +297,55 @@ def _user_ground(context, collection, product_pts):
     return None
 
 
-def render_clay_base(context, filepath: str, collection=None) -> bool:
+def _crest_mesh(name, center, up, forward, half_top, angle_deg, size=300.0):
+    """A ridge: flat top of length 2*half_top along ``forward``, falling away by ``angle_deg`` both ways,
+    with a short rounded shoulder so it reads like a real hilltop."""
+    import bmesh  # noqa: F401  (ensures bmesh is available in Blender)
+    from mathutils import Vector
+    side = forward.cross(up).normalized()
+    a = math.radians(angle_deg)
+    shoulder = half_top * 0.6
+    prof = []  # (distance along forward, drop below crest)
+    for t in (0.0, 0.25, 0.5, 0.75, 1.0):  # rounded shoulder from flat to full slope
+        d = half_top + shoulder * t
+        prof.append((d, math.tan(a) * shoulder * t * t / 2.0))
+    d0, h0 = prof[-1]
+    prof.append((d0 + size, h0 + math.tan(a) * size))
+    line = [(-d, -h) for d, h in reversed(prof)] + [(d, -h) for d, h in prof]
+    verts, faces = [], []
+    for d, h in line:
+        for w in (-size, size):
+            p = center + forward * d + up * h + side * w
+            verts.append((p.x, p.y, p.z))
+    for i in range(len(line) - 1):
+        a0, a1, b0, b1 = 2 * i, 2 * i + 1, 2 * i + 2, 2 * i + 3
+        faces.append((a0, b0, b1, a1))
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    for poly in mesh.polygons:
+        poly.use_smooth = True
+    return mesh
+
+
+def _product_forward(pts, up):
+    """Horizontal (perpendicular to ``up``) axis along which the product is longest."""
+    from mathutils import Vector
+    ref = Vector((1.0, 0.0, 0.0)) if abs(up.x) < 0.9 else Vector((0.0, 1.0, 0.0))
+    a = (ref - up * ref.dot(up)).normalized()
+    b = up.cross(a).normalized()
+    best, best_len = a, -1.0
+    for k in range(18):  # 10° steps over 180°
+        ang = math.pi * k / 18
+        axis = a * math.cos(ang) + b * math.sin(ang)
+        proj = [p.dot(axis) for p in pts]
+        length = max(proj) - min(proj)
+        if length > best_len:
+            best, best_len = axis, length
+    return best, best_len
+
+
+def render_clay_base(context, filepath: str, collection=None, ground="AUTO", crest_angle=10.0) -> bool:
     """Render the Scene Camera with a temporary floor, sun and light-gray world.
 
     This is the edit canvas for the simple direct-edit path: a lit clay render
@@ -319,6 +367,7 @@ def render_clay_base(context, filepath: str, collection=None) -> bool:
     try:
         from mathutils import Vector
         pts = _product_bounds(collection)
+        ground_mode = (ground or "AUTO").upper()
         ground = _user_ground(context, collection, pts)
         up = _product_up_axis(collection)
         slope = math.degrees(math.acos(max(-1.0, min(1.0, up.z))))
@@ -339,6 +388,20 @@ def render_clay_base(context, filepath: str, collection=None) -> bool:
             floor.location.z = _product_floor_z(collection)
         if ground is not None:
             floor.hide_render = True  # the user's own terrain (ramp, curb, road) is the ground
+        elif ground_mode == "CREST" and pts:
+            fwd, length = _product_forward(pts, up)
+            low = min(pts, key=lambda p: p.dot(up))
+            centre = sum(pts, Vector()) / len(pts)
+            centre = centre - up * (centre.dot(up) - low.dot(up))
+            crest = _crest_mesh("_wondful_clay_floor", centre, up, fwd, length * 0.38, crest_angle)
+            old_mesh = floor.data
+            floor.data = crest
+            floor.rotation_mode = "QUATERNION"
+            floor.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+            floor.location = (0.0, 0.0, 0.0)
+            bpy.data.meshes.remove(old_mesh)
+            mesh = crest
+            LAST_CLAY_INFO["crest_deg"] = round(float(crest_angle), 1)
         mat = bpy.data.materials.new("_wondful_clay_floor_mat")
         mat.use_nodes = True
         bsdf = mat.node_tree.nodes.get("Principled BSDF")

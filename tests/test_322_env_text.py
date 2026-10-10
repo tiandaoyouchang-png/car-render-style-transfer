@@ -46,3 +46,19 @@ class EnvTextPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_323_crest_ground_option_wired():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "wondful_ai_renderer"
+    props = (root / "properties.py").read_text(encoding="utf-8")
+    assert 'clay_ground: EnumProperty' in props and '"CREST", "坡顶"' in props
+    assert 'clay_crest_angle: FloatProperty' in props
+    ui = (root / "ui.py").read_text(encoding="utf-8")
+    assert 'ground.prop(props, "clay_ground", expand=True)' in ui
+    ops = (root / "operators.py").read_text(encoding="utf-8")
+    assert 'ground=getattr(props, "clay_ground", "AUTO")' in ops
+    vc = (root / "viewport_capture.py").read_text(encoding="utf-8")
+    assert "def _crest_mesh(" in vc and 'ground_mode == "CREST"' in vc
+    codex_direct = load_package_module("codex_direct")
+    assert "坡顶" in codex_direct.build_simple_prompt("", env_text="雪山")
