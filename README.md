@@ -68,6 +68,7 @@ English: an open-source Blender add-on that turns one camera setup into multiple
 - **结构图约束**：自动渲出 Camera Base、Depth、Normal、部件 ID（Object Index），作为生图的结构参考。
 - **Identity Preserve Mask**：按部件锁定产品身份区域（车标、灯组、轮毂、Logo 等），只放开环境、光影与材质质感。
 - **严格模式验收 + 纠偏**：每张候选图按比例、位置、轮廓检查，不合格自动用 Mask 局部修复重试。
+- **环境图读成文字，构图零漂移**（3.2.2）：只把带地面灯光的白模底图发给图像编辑模型，环境参考图先读成精准文字描述再参与生成，车辆位置、大小、轮廓不再漂移；支持斜坡和改视角。
 - **在白模上直接编辑**（3.2.1）：Codex 默认直连托管图像编辑（gpt-image-2，复用 Codex 的 ChatGPT 登录），以白模底图为画布只改材质、灯光和环境；修复轮次把修复范围作为编辑 Mask 发送。失败时自动回退到 Codex CLI 代理生成。
 - **双 Provider**：Codex 每次独立生成 4 张，Antigravity 每次 2 张；模型列表来自本机官方 CLI，不做跨模型静默回退。
 - **参考图管理**：产品参考决定身份造型，环境参考决定受光、反射和氛围；超出容量的参考自动整理成带编号的图集。

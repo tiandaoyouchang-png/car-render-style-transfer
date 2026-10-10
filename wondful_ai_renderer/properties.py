@@ -181,6 +181,12 @@ class WONDFUL_AddonPreferences(AddonPreferences):
                     "产品形状、位置和尺度更稳；失败时自动改用 Codex 代理生成",
         default=True,
     )
+    codex_direct_simple: BoolProperty(
+        name="简洁输入（只发白模底图）",
+        description="直连编辑时先渲一张带地面和灯光的白模底图，只发这一张图和一段短提示词；"
+                    "不附结构图、三视图和环境照，车的位置和大小最稳",
+        default=True,
+    )
     codex_polish_timeout: IntProperty(
         name="Codex 润色超时（秒）",
         description="Codex AI 润色允许的最长总运行时间；复杂多图任务可能需要数分钟。0 表示不设置插件侧硬超时",
@@ -311,6 +317,7 @@ class WONDFUL_AddonPreferences(AddonPreferences):
         col.prop(self, "long_edge")
         col.prop(self, "codex_imagegen_enabled")
         col.prop(self, "codex_direct_edit")
+        col.prop(self, "codex_direct_simple")
         col.prop(self, "antigravity_imagegen_enabled")
         col.prop(self, "codex_polish_timeout")
         col.prop(self, "codex_audit_timeout")

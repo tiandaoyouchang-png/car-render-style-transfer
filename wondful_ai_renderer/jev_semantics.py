@@ -409,9 +409,9 @@ def analyze_appearance(brief: str, style_notes: list[str] | None = None) -> dict
         scope = "LIGHTING_ONLY"
     elif any(word in text for word in ("只换环境", "换背景", "换成雨天", "换成雪天", "environment only")):
         scope = "ENVIRONMENT_ONLY"
-    elif any(word in text for word in ("镜头改", "构图改", "camera", "framing", "reframe")):
+    elif any(word in text for word in ("镜头改", "构图改", "改构图", "换机位", "改机位", "change camera", "move camera", "change framing", "reframe")):
         scope = "COMPOSITION_REQUEST"
-    elif any(word in text for word in ("几何", "造型改", "车身加", "geometry", "shape change")):
+    elif any(word in text for word in ("改几何", "修改几何", "几何改", "造型改", "改造型", "车身加", "change geometry", "modify geometry", "shape change")):
         scope = "GEOMETRY_REQUEST"
 
     identity_change = any(word in text for word in (

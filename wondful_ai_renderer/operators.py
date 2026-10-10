@@ -1975,6 +1975,21 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
             direct_note = bundle_note
             direct_version = str(getattr(props, "codex_cli_version", "") or "")
             exec_generate = generate_fn
+            direct_simple_base = ""
+            direct_simple_brief = None
+            if bool(getattr(prefs, "codex_direct_simple", True)):
+                clay_path = str(Path(self._session.viewport_reference).parent / "01_clay_base.png")
+                try:
+                    from .viewport_capture import render_clay_base
+                    if render_clay_base(context, clay_path, getattr(props, "product_collection", None)):
+                        direct_simple_base = clay_path
+                        direct_simple_brief = (getattr(props, "scene_brief", "") or "").strip()
+                except Exception as exc:
+                    print(f"[Wondful] 白模底图渲染失败，改用相机截图：{exc}")
+                if direct_simple_brief is None and Path(self._session.viewport_reference).is_file():
+                    direct_simple_base = str(self._session.viewport_reference)
+                    direct_simple_brief = (getattr(props, "scene_brief", "") or "").strip()
+            direct_state["simple_base"] = Path(direct_simple_base).name if direct_simple_base else ""
 
             def _direct_status(text):
                 self._phase = text
@@ -1984,6 +1999,7 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                     kwargs, fallback=exec_generate, state=direct_state, size=direct_size,
                     manifest=direct_manifest, bundle_note=direct_note, client_version=direct_version,
                     on_status=_direct_status, cancel_check=_cancel_requested,
+                    simple_base=direct_simple_base, simple_brief=direct_simple_brief,
                 )
         provider_cli_path = provider["cli_path"]
         provider_model = provider["model"]

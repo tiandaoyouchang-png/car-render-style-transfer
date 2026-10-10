@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "Wondful AI 渲染器-测试版3.2.1 · Direct Image Edit",
+    "name": "Wondful AI 渲染器-测试版3.2.2 · Env Text Lock",
     "author": "Wondful AI",
-    "version": (3, 2, 1),
+    "version": (3, 2, 2),
     "blender": (4, 3, 0),
     "location": "3D Viewport > Sidebar > Wondful AI",
     "description": "Deterministic Geometry → Structure Packet → Generative Appearance；Camera Base + Mask/Depth/Normal/Silhouette/Part-ID + Jev Semantic Layer",

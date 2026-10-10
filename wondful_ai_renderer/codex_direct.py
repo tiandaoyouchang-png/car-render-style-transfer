@@ -37,7 +37,7 @@ IMAGE_MODEL = "gpt-image-2"
 ORIGINATOR = "codex_cli_rs"
 MAX_EDIT_IMAGES = 5
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
-ADDON_UA = "wondful-ai-renderer/3.2.1"
+ADDON_UA = "wondful-ai-renderer/3.2.2"
 BASE_URL_ENV = "WONDFUL_CODEX_IMAGE_BASE_URL"
 REFRESH_URL_ENV = "WONDFUL_CODEX_REFRESH_URL"
 
@@ -57,6 +57,7 @@ ROLE_LABELS = {
     "control_bundle": "参考图集（格内标签见图上 R 编号）",
 }
 # Lower number = kept first when the 5-image limit forces a drop.
+SIMPLE_ENV_LIMIT = 2
 ROLE_PRIORITY = {"camera": 0, "product": 1, "environment": 2, "appearance": 2, "control_bundle": 2,
                  "person": 3, "structure": 4}
 
@@ -485,6 +486,33 @@ def build_edit_prompt(prompt, images, *, mask=False, repair=False, correction=""
     return "\n".join(lines)
 
 
+def build_simple_prompt(brief, fallback_prompt="", env_count=0, env_text=""):
+    """Short edit prompt for the simple path: only the clay canvas is sent.
+
+    The environment reference is read separately and arrives here as text
+    (``env_text``), so its camera and layout can never pull the composition.
+    """
+    scene = (brief or "").strip()
+    env_text = (env_text or "").strip()
+    lines = ["把这张 Blender 白模渲染图直接编辑成一张写实的商业广告摄影照片，车与环境自然融合。"]
+    lines.append("产品与构图严格保持原图：车在画面中的位置、大小、角度、透视、轮廓、车轮、灯组、Logo、字标和车牌都不变；"
+                 "相机机位、地平线和构图不变，不平移、不缩放、不裁切、不旋转。")
+    lines.append("地面的坡度、倾斜方向、起伏以及与车轮的接触关系以原图白模地面为准（可能是斜坡、坡道或路沿），"
+                 "新环境的路面材质贴合这块地面铺设，不要把地面改平、改坡度或让车悬空；相机的俯仰和倾斜也保持不变。")
+    lines.append("原图里的灰色地面、背景和灯光只是占位：全部替换为下面描述的环境，并按新环境重新计算车身的光照、高光、反射和投影，"
+                 "不要保留白模里的高光和亮度。车漆保持原本的颜色色相（固有色），明暗随新环境光变化。")
+    if env_text:
+        lines.append("目标环境（来自环境参考图的文字描述，只用于环境、地面、天气、光线方向、色温和氛围）：" + env_text)
+        lines.append("环境严格按上面的描述还原：只出现描述里写到的元素，不额外添加建筑、遗迹、太阳、眩光、云层等描述没写的东西，"
+                     "光线方向、太阳高度、色温和反差与描述一致，不要做得比描述更戏剧化。")
+    if scene:
+        lines.append("场景要求：" + scene + "。")
+    elif not env_text and fallback_prompt:
+        lines.append("场景要求：" + fallback_prompt.strip()[:400])
+    lines.append("地面接触阴影、反射和环境光与新场景一致，照片质感真实自然。只输出一张图。")
+    return "\n".join(lines)
+
+
 def build_payload(prompt, images, *, size, mask_path="", model="", quality="high", compat=False):
     content = [{"type": "input_text", "text": prompt}]
     summary = []
@@ -590,6 +618,39 @@ def extract_image(events):
     raise DirectEditError("响应里没有图像结果" + (f"（最后状态 {last_status}）" if last_status else ""), kind="parse")
 
 
+def extract_text(events):
+    """Return the assistant text from Responses stream events (text-only call)."""
+    deltas, final = [], ""
+    for data in events:
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = str(event.get("type", ""))
+        if etype in {"response.failed", "response.incomplete", "error"}:
+            resp = event.get("response") if isinstance(event.get("response"), dict) else {}
+            err = resp.get("error") or event.get("error") or event
+            raise DirectEditError(f"环境描述失败：{str((err or {}).get('message') or etype)[:200]}", kind="server")
+        if etype == "response.output_text.delta":
+            deltas.append(str(event.get("delta") or ""))
+        elif etype == "response.output_text.done" and event.get("text"):
+            final = str(event["text"])
+        elif etype == "response.completed":
+            resp = event.get("response") or {}
+            for item in resp.get("output") or []:
+                for part in (item or {}).get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text" and part.get("text"):
+                        final = final or str(part["text"])
+    text = (final or "".join(deltas)).strip()
+    if not text:
+        raise DirectEditError("环境描述为空", kind="parse")
+    return text
+
+
 def _line_iter(resp, cancel_check):
     pending = b""
     read = getattr(resp, "read1", None) or resp.read
@@ -607,7 +668,7 @@ def _line_iter(resp, cancel_check):
         yield pending.decode("utf-8", errors="replace")
 
 
-def post_responses(url, headers, payload, *, timeout, cancel_check=None):
+def post_responses(url, headers, payload, *, timeout, cancel_check=None, want="image"):
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     req = urlrequest.Request(url, data=body, headers=headers, method="POST")
     holder = {}
@@ -627,7 +688,8 @@ def post_responses(url, headers, payload, *, timeout, cancel_check=None):
     try:
         with urlrequest.urlopen(req, timeout=timeout) as resp:
             holder["resp"] = resp
-            return extract_image(parse_sse_events(_line_iter(resp, cancel_check)))
+            events = parse_sse_events(_line_iter(resp, cancel_check))
+            return extract_text(events) if want == "text" else extract_image(events)
     except urlerror.HTTPError as exc:
         try:
             text = exc.read().decode("utf-8", errors="replace")
@@ -662,12 +724,105 @@ def _http_error(status, text):
     return DirectEditError(f"HTTP {status}：服务器错误", kind="server", status=status)
 
 
+# --------------------------------------------------------------------------- environment description
+
+ENV_DESCRIBE_PROMPT = (
+    "你是汽车广告摄影的灯光与美术指导。请只阅读这张环境参考图，写一段 150–220 字的中文环境描述，"
+    "供另一张图严格按此重建环境。要求精准、克制，只写图中确实可见的内容，不推测、不美化、不补充。依次写清：\n"
+    "1. 场景与背景元素：逐项列出可见的山体、建筑、植被、路牌、护栏等，并写明数量级和远近；\n"
+    "2. 地面/路面：材质、颜色、干湿、积雪或积水情况；\n"
+    "3. 天气与天空：晴/阴/雾/雪，云量，天空颜色；\n"
+    "4. 光线：主光方向（画面左/右/前/后/顶）、太阳高度、太阳是否出现在画面内、光质软硬、阴影长短；\n"
+    "5. 色温与主色调、反差、大气通透度与氛围。\n"
+    "不要描述构图、机位、视角、焦段、画面布局或物体在画面中的位置，不要提到参考图里的车辆或人物。"
+    "最后单独一句写「不要出现：」列出这张图里没有、但同类场景常被加上的元素（例如画面内的太阳、眩光、古堡遗迹、云海）。"
+    "只输出描述本身，不要标题。"
+)
+_ENV_LOCK = threading.Lock()
+
+
+def _file_md5(path):
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def describe_environment(env_paths, *, auth, auth_path, client_version="", model="", cache_dir="",
+                         timeout=180, cancel_check=None, log=None):
+    """Read the environment reference(s) with a text-only call; return one Chinese description.
+
+    The reference images are never sent to the image model: only this text is.
+    Results are cached per file hash in ``cache_dir/env_descriptions.json``.
+    """
+    paths = [str(p) for p in env_paths or [] if p and Path(p).is_file()]
+    if not paths:
+        return "", auth
+    cache_file = Path(cache_dir) / "env_descriptions.json" if cache_dir else None
+    base = os.environ.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL
+    url = base.rstrip("/") + "/responses"
+    texts = []
+    with _ENV_LOCK:
+        cache = {}
+        if cache_file and cache_file.is_file():
+            try:
+                cache = json.loads(cache_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                cache = {}
+        for path in paths:
+            key = _file_md5(path)
+            if cache.get(key):
+                texts.append(cache[key])
+                continue
+            url_img, _mime, _n = data_url(path)
+            payload = {
+                "model": (model or "").strip() or DEFAULT_MODEL,
+                "instructions": "Describe the environment in the image as asked. Do not use any tool.",
+                "input": [{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": ENV_DESCRIBE_PROMPT},
+                    {"type": "input_image", "image_url": url_img}]}],
+                "tools": [], "parallel_tool_calls": False, "store": False, "stream": True, "include": [],
+            }
+            refreshed = False
+            while True:
+                t0 = time.time()
+                try:
+                    text = post_responses(url, auth_headers(auth, client_version), payload, timeout=timeout,
+                                          cancel_check=cancel_check, want="text")
+                    break
+                except DirectEditError as exc:
+                    if exc.kind == "auth" and exc.status == 401 and not refreshed:
+                        refreshed = True
+                        auth = refresh_auth(auth, auth_path)
+                        continue
+                    raise
+            text = re.sub(r"\s+", " ", text).strip()[:900]
+            cache[key] = text
+            texts.append(text)
+            if log is not None:
+                log.setdefault("env_describe", []).append(
+                    {"file": Path(path).name, "seconds": round(time.time() - t0, 1), "text": text})
+        if cache_file:
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+    return "\n".join(texts), auth
+
+
 # --------------------------------------------------------------------------- main entry
 
 def edit_image(*, prompt, edit_base_path, reference_paths, output_path, size, mask_path="", manifest=None,
                repair=False, model="", client_version="", timeout=900, log_dir="", tag="",
-               cancel_check=None, correction=""):
-    """Edit ``edit_base_path`` (image 1) and save one PNG to ``output_path``."""
+               cancel_check=None, correction="", simple_brief=None):
+    """Edit ``edit_base_path`` (image 1) and save one PNG to ``output_path``.
+
+    ``simple_brief`` (not None) = simple path: only the canvas is sent, with a
+    short scene prompt, like a hand-made edit on the clay render.
+    """
     started = time.time()
     if not edit_base_path or not Path(edit_base_path).is_file():
         raise DirectEditError("编辑底图不存在", kind="input")
@@ -677,15 +832,47 @@ def edit_image(*, prompt, edit_base_path, reference_paths, output_path, size, ma
     auth = load_auth(auth_path)
     if token_expiring(access_token(auth)):
         auth = refresh_auth(auth, auth_path)
-    images, dropped = select_images(edit_base_path, reference_paths, manifest, repair=repair)
+    simple = simple_brief is not None and not repair
+    if simple:
+        images = [(str(Path(edit_base_path).resolve()), "camera", "白模底图")]
+        labels = _labels_from_manifest(manifest)
+        env = []
+        dropped = []
+        for ref in reference_paths or []:
+            rp = str(Path(ref).resolve())
+            role = labels.get(rp, ("", ""))[0]
+            if role == "environment" and len(env) < SIMPLE_ENV_LIMIT and rp not in env:
+                env.append(rp)
+            else:
+                dropped.append((rp, "simple"))
+        # Environment refs are read as text only; the image model sees just the clay canvas.
+        env_paths = env
+    else:
+        images, dropped = select_images(edit_base_path, reference_paths, manifest, repair=repair)
+    if not simple:
+        env_paths = []
     log_root = Path(log_dir or Path(output_path).parent)
     mask, mask_note = prepare_mask(mask_path, _png_size(images[0][0]), log_root)
-    text = build_edit_prompt(prompt, images, mask=bool(mask), repair=repair, correction=correction)
+    env_text, env_note = "", ""
+    if simple and env_paths:
+        try:
+            env_text, auth = describe_environment(env_paths, auth=auth, auth_path=auth_path,
+                                                  client_version=client_version, model=model,
+                                                  cache_dir=str(log_root), cancel_check=cancel_check)
+        except DirectEditError as exc:
+            if exc.kind == "cancelled":
+                raise
+            env_note = "环境描述失败：" + str(exc)[:160]
+    if simple:
+        text = build_simple_prompt(simple_brief, prompt, env_text=env_text)
+    else:
+        text = build_edit_prompt(prompt, images, mask=bool(mask), repair=repair, correction=correction)
     base = os.environ.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL
     url = base.rstrip("/") + "/responses"
     log = {"tag": tag, "url_host": re.sub(r"^(https?://[^/]+).*$", r"\1", url), "size": size,
            "images": [], "dropped": [Path(p).name + f"({r})" for p, r in dropped], "mask_note": mask_note,
-           "attempts": []}
+           "attempts": [], "simple": simple, "prompt": text[:4000],
+           "env_refs_as_text": [Path(p).name for p in env_paths] if simple else [], "env_note": env_note}
     model_used = (model or "").strip() or DEFAULT_MODEL
     variants = [dict(compat=False, model=model_used)]
     if model_used != DEFAULT_MODEL:
@@ -760,6 +947,7 @@ def edit_image(*, prompt, edit_base_path, reference_paths, output_path, size, ma
         "dropped_images": [r for _p, r in dropped],
         "mask": bool(mask),
         "mask_note": mask_note,
+        "simple": simple,
         "size_requested": size,
         "size_returned": list(image_dimensions(target) or []),
         "model": log["attempts"][-1]["model"] if log["attempts"] else model_used,
@@ -776,7 +964,8 @@ def short_reason(exc) -> str:
 
 
 def generate_with_fallback(kwargs, *, fallback, state, size, manifest=None, bundle_note="",
-                           client_version="", on_status=None, cancel_check=None):
+                           client_version="", on_status=None, cancel_check=None,
+                           simple_base="", simple_brief=None):
     """Try the direct edit; on any failure log it and run ``fallback(**kwargs)`` (codex exec).
 
     ``state`` is a per-render dict: once a fatal error happens (auth, endpoint),
@@ -789,6 +978,9 @@ def generate_with_fallback(kwargs, *, fallback, state, size, manifest=None, bund
     edit_base = kwargs.get("edit_base_path") or (list(kwargs.get("reference_paths") or [""])[0])
     references = list(kwargs.get("reference_paths") or [])
     repair = bool(edit_base and references and Path(edit_base).resolve() != Path(references[0]).resolve())
+    use_simple = simple_brief is not None and not repair and simple_base and Path(simple_base).is_file()
+    if use_simple:
+        edit_base = simple_base
     if not state["disabled"]:
         prompt = kwargs.get("prompt", "")
         if bundle_note:
@@ -801,6 +993,7 @@ def generate_with_fallback(kwargs, *, fallback, state, size, manifest=None, bund
                 manifest=manifest, repair=repair, model=kwargs.get("model", ""),
                 client_version=client_version, timeout=max(60, int(kwargs.get("timeout") or 900) or 900),
                 log_dir=kwargs.get("cwd", ""), tag=out.stem, cancel_check=cancel_check,
+                simple_brief=simple_brief if use_simple else None,
             )
             state["direct_ok"] += 1
             return result
