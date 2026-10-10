@@ -68,6 +68,7 @@ English: an open-source Blender add-on that turns one camera setup into multiple
 - **结构图约束**：自动渲出 Camera Base、Depth、Normal、部件 ID（Object Index），作为生图的结构参考。
 - **Identity Preserve Mask**：按部件锁定产品身份区域（车标、灯组、轮毂、Logo 等），只放开环境、光影与材质质感。
 - **严格模式验收 + 纠偏**：每张候选图按比例、位置、轮廓检查，不合格自动用 Mask 局部修复重试。
+- **在白模上直接编辑**（3.2.1）：Codex 默认直连托管图像编辑（gpt-image-2，复用 Codex 的 ChatGPT 登录），以白模底图为画布只改材质、灯光和环境；修复轮次把修复范围作为编辑 Mask 发送。失败时自动回退到 Codex CLI 代理生成。
 - **双 Provider**：Codex 每次独立生成 4 张，Antigravity 每次 2 张；模型列表来自本机官方 CLI，不做跨模型静默回退。
 - **参考图管理**：产品参考决定身份造型，环境参考决定受光、反射和氛围；超出容量的参考自动整理成带编号的图集。
 - **AI 润色提示词**：给参考图即可，AI 先分析环境的主光、色温和氛围（结果可编辑），再写成完整提示词；也可输入中文创意需求一键扩写。
@@ -86,7 +87,7 @@ Blender 场景 + 相机 + 产品集合
  提示词（AI 润色）+ 产品参考 + 环境参考
         │
         ▼
- Codex CLI / Antigravity CLI 生图（本机登录）
+ Codex 图像编辑直连（白模为画布）/ Codex CLI / Antigravity CLI 生图（本机登录）
         │
         ▼
  比例适配 → 结构验收 → Identity Mask 纠偏（严格模式）
@@ -144,7 +145,8 @@ docs/showcase/             README 展示图
 
 ## 已知限制
 
-- 结构图以参考图形式交给 CLI 的生图工具，不是原生 ControlNet，无法保证像素级对齐；严格模式的验收与 Mask 纠偏用来兜底。
+- 结构图以参考图形式交给生图工具，不是原生 ControlNet，无法保证像素级对齐；GPT Image 的编辑 Mask 是提示性的（模型参考 Mask，但不保证 Mask 外逐像素不变）。严格模式的验收与 Mask 纠偏用来兜底。
+- Codex 图像编辑直连使用的是 Codex 自己的 ChatGPT 后端接口（非公开 API），接口变化时会自动回退到 CLI 代理生成；需要 Codex 使用文件方式保存登录（`auth.json`）。
 - 实际出图质量取决于 CLI 背后的图像模型与账号额度；严格模式的远程调用次数可能多于最终导出张数。
 - Blender 5.x 的合成器 API 有较大变化，自 3.1.6 起已适配（实测 Blender 5.1.2）。
 

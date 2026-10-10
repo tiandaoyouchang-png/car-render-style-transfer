@@ -1961,6 +1961,30 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
         provider = _analysis_provider(props, prefs)
         generate_fn = provider["generate"]
         audit_fn = provider["audit"]
+        # 3.2.1: Codex 图像编辑（直连）— edit the camera base with the hosted
+        # image_generation tool; any failure falls back to the codex exec agent.
+        self._direct_state = None
+        props.last_engine_note = ""
+        if provider["id"] == "codex" and bool(getattr(prefs, "codex_direct_edit", True)):
+            from . import codex_direct
+            from .cli_transport import is_cancellation_requested as _cancel_requested
+            direct_state = {}
+            self._direct_state = direct_state
+            direct_size = codex_direct.choose_edit_size(camera_w, camera_h, effective_long_edge)
+            direct_manifest = list((self._reference_bundle or {}).get("groups", []))
+            direct_note = bundle_note
+            direct_version = str(getattr(props, "codex_cli_version", "") or "")
+            exec_generate = generate_fn
+
+            def _direct_status(text):
+                self._phase = text
+
+            def generate_fn(**kwargs):
+                return codex_direct.generate_with_fallback(
+                    kwargs, fallback=exec_generate, state=direct_state, size=direct_size,
+                    manifest=direct_manifest, bundle_note=direct_note, client_version=direct_version,
+                    on_status=_direct_status, cancel_check=_cancel_requested,
+                )
         provider_cli_path = provider["cli_path"]
         provider_model = provider["model"]
         provider_id = provider["id"]
@@ -2290,6 +2314,9 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
 
             elapsed = time.time() - self._started_at
             self._cleanup(context)
+            if getattr(self, "_direct_state", None) is not None:
+                from .codex_direct import engine_note
+                props.last_engine_note = engine_note(self._direct_state)
             if self._error:
                 exc, _tb = self._error
                 if isinstance(exc, AntigravityNotLoggedInError):
@@ -2458,6 +2485,7 @@ class WONDFUL_OT_ai_render(_BaseAsyncOperator):
                     "identity_preserve_mask_path": result_data.get("identity_mask_path", ""),
                     "identity_hard_restore": bool(result_data.get("identity_hard_restore", False)),
                     "provider_response": self._result,
+                    "codex_direct_edit": getattr(self, "_direct_state", None),
                 },
             )
             record_timing(getattr(self, "_timing_key", f"{getattr(self, '_provider_id', 'codex')}_render_standard"), elapsed)

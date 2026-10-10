@@ -1,0 +1,848 @@
+"""3.2.1 · Codex 图像编辑（直连）.
+
+Calls the hosted ``image_generation`` tool of the Codex Responses backend
+directly, on the user's existing ChatGPT/Codex login (``~/.codex/auth.json``),
+so the Blender camera base is *edited* (image 1 = canvas, optional
+``input_image_mask``) instead of an agent re-drawing a new picture from
+references.  Pure standard library + numpy; safe on a worker thread (no bpy).
+
+Payload, headers, SSE parsing and token refresh follow the open-source
+reference clients jdmnk/codex-imagegen-cli and the PyPI package
+codex-image-gen.  Any failure raises :class:`DirectEditError`; the caller
+falls back to the ``codex exec`` agent path.  Tokens are never logged.
+"""
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import math
+import os
+import platform
+import re
+import struct
+import threading
+import time
+import uuid
+import zlib
+from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
+
+DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex"
+DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token"
+CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+DEFAULT_MODEL = "gpt-5.5"
+IMAGE_MODEL = "gpt-image-2"
+ORIGINATOR = "codex_cli_rs"
+MAX_EDIT_IMAGES = 5
+MAX_IMAGE_BYTES = 32 * 1024 * 1024
+ADDON_UA = "wondful-ai-renderer/3.2.1"
+BASE_URL_ENV = "WONDFUL_CODEX_IMAGE_BASE_URL"
+REFRESH_URL_ENV = "WONDFUL_CODEX_REFRESH_URL"
+
+INSTRUCTIONS = (
+    "Use the image_generation tool exactly once to EDIT the first input image and return one PNG. "
+    "The first input image is the canvas: keep its framing, camera, product geometry, position, scale, "
+    "perspective and silhouette. Later input images are references only. Do not use any other tool."
+)
+
+ROLE_LABELS = {
+    "camera": "Blender 相机白模底图（构图 / 几何的唯一权威）",
+    "structure": "Blender 结构控制图（只管几何，不是外观）",
+    "product": "产品三视图（只看产品造型与身份细节，不取其打光和背景）",
+    "person": "人物参考（只看人物身份）",
+    "environment": "环境参考图（决定环境、光线方向、色温与氛围）",
+    "appearance": "外观参考图集（格内标签见图上 R 编号）",
+    "control_bundle": "参考图集（格内标签见图上 R 编号）",
+}
+# Lower number = kept first when the 5-image limit forces a drop.
+ROLE_PRIORITY = {"camera": 0, "product": 1, "environment": 2, "appearance": 2, "control_bundle": 2,
+                 "person": 3, "structure": 4}
+
+
+class DirectEditError(RuntimeError):
+    """Direct edit failed; ``fatal`` = do not retry direct for the rest of this render."""
+
+    def __init__(self, message, *, kind="error", status=0, fatal=False, detail=""):
+        super().__init__(message)
+        self.detail = detail
+        self.kind = kind
+        self.status = int(status or 0)
+        self.fatal = bool(fatal)
+
+
+# --------------------------------------------------------------------------- auth
+
+def auth_file_candidates() -> list[Path]:
+    paths = []
+    home_env = os.environ.get("CODEX_HOME", "").strip()
+    if home_env:
+        paths.append(Path(home_env).expanduser() / "auth.json")
+    userprofile = os.environ.get("USERPROFILE", "").strip()
+    if userprofile:
+        paths.append(Path(userprofile) / ".codex" / "auth.json")
+    paths.append(Path.home() / ".codex" / "auth.json")
+    seen, out = set(), []
+    for p in paths:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def find_auth_file() -> Path | None:
+    for p in auth_file_candidates():
+        try:
+            if p.is_file():
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _b64url_json(segment: str) -> dict:
+    try:
+        raw = base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return {}
+
+
+def jwt_claims(token) -> dict:
+    if not isinstance(token, str) or token.count(".") < 2:
+        return {}
+    return _b64url_json(token.split(".")[1])
+
+
+def _id_claims(tokens: dict) -> dict:
+    id_token = tokens.get("id_token")
+    if isinstance(id_token, dict):  # legacy layout
+        if isinstance(id_token.get("raw_jwt"), str):
+            return (jwt_claims(id_token["raw_jwt"]).get("https://api.openai.com/auth") or {})
+        return id_token
+    return jwt_claims(id_token).get("https://api.openai.com/auth") or {}
+
+
+def load_auth(path: Path) -> dict:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise DirectEditError("未找到 Codex 登录文件 auth.json", kind="auth", fatal=True) from exc
+    except (OSError, ValueError) as exc:
+        raise DirectEditError("Codex 登录文件 auth.json 无法读取", kind="auth", fatal=True) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("tokens"), dict):
+        raise DirectEditError("auth.json 里没有 ChatGPT 登录令牌（可能是 API Key 登录或系统钥匙串存储）",
+                              kind="auth", fatal=True)
+    return data
+
+
+def account_id(auth: dict) -> str:
+    tokens = auth.get("tokens") or {}
+    value = tokens.get("account_id")
+    if isinstance(value, str) and value:
+        return value
+    value = _id_claims(tokens).get("chatgpt_account_id")
+    return value if isinstance(value, str) else ""
+
+
+def access_token(auth: dict) -> str:
+    value = (auth.get("tokens") or {}).get("access_token")
+    return value if isinstance(value, str) else ""
+
+
+def token_expiring(token: str, leeway: int = 120) -> bool:
+    exp = jwt_claims(token).get("exp")
+    return isinstance(exp, (int, float)) and exp <= time.time() + leeway
+
+
+_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_auth(auth: dict, path: Path, timeout: float = 30) -> dict:
+    """Refresh with the stored refresh_token and write auth.json back atomically.
+
+    Re-reads the file first: if Codex already refreshed it, the newer tokens are
+    used instead of rotating the refresh token a second time.
+    """
+    with _REFRESH_LOCK:
+        current = load_auth(path)
+        if account_id(current) and account_id(auth) and account_id(current) != account_id(auth):
+            raise DirectEditError("Codex 账号在生成期间发生变化", kind="auth", fatal=True)
+        if current.get("tokens") != auth.get("tokens") and access_token(current) and not token_expiring(access_token(current)):
+            return current
+        tokens = dict(current.get("tokens") or {})
+        refresh_token = tokens.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise DirectEditError("Codex 登录已过期且没有 refresh_token，请重新登录 Codex", kind="auth", fatal=True)
+        body = json.dumps({"client_id": CODEX_CLIENT_ID, "grant_type": "refresh_token",
+                           "refresh_token": refresh_token, "scope": "openid profile email offline_access"}).encode()
+        url = os.environ.get(REFRESH_URL_ENV, DEFAULT_REFRESH_URL)
+        req = urlrequest.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": "application/json", "Accept": "application/json"})
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as resp:
+                refreshed = json.loads(resp.read().decode("utf-8"))
+        except urlerror.HTTPError as exc:
+            # OAuth error bodies may echo credentials: never include them.
+            raise DirectEditError(f"Codex 令牌刷新失败（HTTP {exc.code}），请在终端重新运行 codex login",
+                                  kind="auth", status=exc.code, fatal=True) from exc
+        except (urlerror.URLError, OSError, ValueError) as exc:
+            raise DirectEditError(f"Codex 令牌刷新失败：{type(exc).__name__}", kind="network", fatal=True) from exc
+        if not isinstance(refreshed, dict) or not isinstance(refreshed.get("access_token"), str):
+            raise DirectEditError("Codex 令牌刷新没有返回 access_token", kind="auth", fatal=True)
+        for key in ("access_token", "refresh_token", "id_token"):
+            if isinstance(refreshed.get(key), str) and refreshed[key]:
+                tokens[key] = refreshed[key]
+        updated = dict(current)
+        updated["tokens"] = tokens
+        updated["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        if load_auth(path) != current:
+            raise DirectEditError("auth.json 在刷新期间被 Codex 修改，放弃写回", kind="auth", fatal=True)
+        tmp = Path(str(path) + f".wondful-{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+        return updated
+
+
+def _client_version(text: str) -> str:
+    m = re.search(r"(\d+\.\d+\.\d+)", text or "")
+    return m.group(1) if m else ""
+
+
+def auth_headers(auth: dict, client_version: str = "") -> dict:
+    token = access_token(auth)
+    acct = account_id(auth)
+    if not token:
+        raise DirectEditError("auth.json 里没有 access_token，请重新登录 Codex", kind="auth", fatal=True)
+    if not acct:
+        raise DirectEditError("auth.json 里没有 ChatGPT 账号 ID，请重新登录 Codex", kind="auth", fatal=True)
+    version = _client_version(client_version)
+    ua_version = version or "0"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "ChatGPT-Account-ID": acct,
+        "originator": ORIGINATOR,
+        "OpenAI-Beta": "responses=experimental",
+        "User-Agent": f"{ORIGINATOR}/{ua_version} ({platform.system() or 'unknown'} {platform.release() or ''}; "
+                      f"{platform.machine() or 'unknown'}) {ADDON_UA}",
+        "session_id": str(uuid.uuid4()),
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if version:
+        headers["version"] = version
+    if _id_claims(auth.get("tokens") or {}).get("chatgpt_account_is_fedramp"):
+        headers["X-OpenAI-Fedramp"] = "true"
+    return headers
+
+
+def redact_headers(headers: dict) -> dict:
+    out = dict(headers)
+    if "Authorization" in out:
+        out["Authorization"] = "Bearer <redacted>"
+    if out.get("ChatGPT-Account-ID"):
+        out["ChatGPT-Account-ID"] = "<redacted>"
+    return out
+
+
+# --------------------------------------------------------------------------- images
+
+def sniff_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "application/octet-stream"
+
+
+def data_url(path) -> tuple[str, str, int]:
+    data = Path(path).read_bytes()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise DirectEditError(f"图片过大（{len(data) // (1024 * 1024)} MB）：{Path(path).name}", kind="input")
+    mime = sniff_mime(data)
+    if mime == "application/octet-stream":
+        raise DirectEditError(f"无法识别的图片格式：{Path(path).name}", kind="input")
+    return f"data:{mime};base64," + base64.b64encode(data).decode("ascii"), mime, len(data)
+
+
+def choose_edit_size(width: int, height: int, long_edge: int = 2048) -> str:
+    """WxH closest to the camera aspect within gpt-image-2 limits.
+
+    Limits (from the reference clients): multiples of 16, edges <= 3840,
+    aspect between 1:3 and 3:1, 655,360 - 8,294,400 pixels.
+    """
+    width, height = max(1, int(width)), max(1, int(height))
+    ratio = min(3.0, max(1 / 3.0, width / height))
+    target_long = min(3840, max(1024, int(long_edge)))
+    best = None
+    for long_side in range(max(512, target_long - 256), min(3840, target_long + 256) + 1, 16):
+        if ratio >= 1:
+            w, h = long_side, max(16, int(round(long_side / ratio / 16.0)) * 16)
+        else:
+            h, w = long_side, max(16, int(round(long_side * ratio / 16.0)) * 16)
+        if max(w, h) > 3840 or max(w, h) > 3 * min(w, h) or not (655360 <= w * h <= 8294400):
+            continue
+        err = abs((w / h) / ratio - 1.0)
+        key = (round(err, 4), abs(long_side - target_long))
+        if best is None or key < best[0]:
+            best = (key, w, h)
+    if best is None:
+        return "1536x1024" if ratio >= 1 else "1024x1536"
+    return f"{best[1]}x{best[2]}"
+
+
+def _image_size(path):
+    try:
+        from .composition import image_dimensions
+        size = image_dimensions(path)
+        return list(size) if size else []
+    except Exception:
+        return []
+
+
+def _png_size(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+        if head.startswith(b"\x89PNG\r\n\x1a\n") and head[12:16] == b"IHDR":
+            return struct.unpack(">II", head[16:24])
+    except OSError:
+        pass
+    return None
+
+
+def read_png_rgba(path):
+    """Minimal 8-bit, non-interlaced PNG decoder (for our own masks). Returns HxWx4 uint8."""
+    import numpy as np
+    data = Path(path).read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("not a PNG")
+    pos, idat, ihdr = 8, [], None
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        chunk = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", chunk)
+        elif kind == b"IDAT":
+            idat.append(chunk)
+        elif kind == b"IEND":
+            break
+        pos += 12 + length
+    if ihdr is None:
+        raise ValueError("no IHDR")
+    w, h, depth, ctype, _c, _f, interlace = ihdr
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(ctype)
+    if depth != 8 or interlace or channels is None:
+        raise ValueError("unsupported PNG layout")
+    raw = zlib.decompress(b"".join(idat))
+    stride = w * channels
+    rows = np.frombuffer(raw, dtype=np.uint8).reshape(h, stride + 1)
+    out = np.zeros((h, stride), dtype=np.uint8)
+    prev = np.zeros(stride, dtype=np.int32)
+    for y in range(h):
+        ftype, line = int(rows[y, 0]), rows[y, 1:].astype(np.int32)
+        if ftype == 0:
+            cur = line
+        elif ftype == 1:
+            cur = line.reshape(w, channels).cumsum(axis=0).reshape(-1) & 0xFF
+        elif ftype == 2:
+            cur = (line + prev) & 0xFF
+        else:
+            cur = np.zeros(stride, dtype=np.int32)
+            for i in range(stride):
+                a = int(cur[i - channels]) if i >= channels else 0
+                b = int(prev[i])
+                c = int(prev[i - channels]) if i >= channels else 0
+                if ftype == 3:
+                    pred = (a + b) // 2
+                else:
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                cur[i] = (int(line[i]) + pred) & 0xFF
+        out[y] = cur
+        prev = cur
+    img = out.reshape(h, w, channels)
+    if channels == 4:
+        return img
+    rgba = np.full((h, w, 4), 255, dtype=np.uint8)
+    if channels == 3:
+        rgba[:, :, :3] = img
+    elif channels == 2:
+        rgba[:, :, :3] = img[:, :, :1]
+        rgba[:, :, 3] = img[:, :, 1]
+    else:  # grayscale: white = editable (OpenAI alpha convention: transparent = edit)
+        rgba[:, :, :3] = img
+        rgba[:, :, 3] = 255 - img[:, :, 0]
+    return rgba
+
+
+def prepare_mask(mask_path, base_size, out_dir) -> tuple[str, str]:
+    """Return (path, note). The mask must be an alpha PNG the same size as image 1."""
+    if not mask_path or not Path(mask_path).is_file():
+        return "", ""
+    mask_size = _png_size(mask_path)
+    if mask_size is None:
+        return "", "Mask 不是 PNG，已忽略"
+    if not base_size or tuple(mask_size) == tuple(base_size):
+        return str(mask_path), ""
+    import numpy as np
+    from .identity_preserve import write_rgba_png
+    try:
+        rgba = read_png_rgba(mask_path)
+    except Exception as exc:
+        return "", f"Mask 尺寸与底图不一致且无法重采样（{exc}），已忽略"
+    bw, bh = int(base_size[0]), int(base_size[1])
+    sh, sw = rgba.shape[:2]
+    ys = np.minimum(sh - 1, ((np.arange(bh) + 0.5) * sh / bh).astype(np.int64))
+    xs = np.minimum(sw - 1, ((np.arange(bw) + 0.5) * sw / bw).astype(np.int64))
+    resized = rgba[ys[:, None], xs[None, :]]
+    target = Path(out_dir) / (Path(mask_path).stem + f"_{bw}x{bh}.png")
+    return write_rgba_png(target, resized), f"Mask 已重采样到 {bw}×{bh}"
+
+
+# --------------------------------------------------------------------------- payload
+
+def _labels_from_manifest(manifest) -> dict:
+    """path -> (role, label) using the reference bundle manifest."""
+    out = {}
+    for group in manifest or []:
+        members = group.get("members") or []
+        path = str(group.get("path", ""))
+        if not path or not members:
+            continue
+        roles = [str(m.get("role", "")) for m in members]
+        if len(members) == 1:
+            role = roles[0]
+            sub = str(members[0].get("sub_role") or "")
+            label = ROLE_LABELS.get(role, role)
+            if role == "structure" and sub:
+                label = f"Blender 结构控制图 · {sub}（只管几何，不是外观）"
+        else:
+            role = min(roles, key=lambda r: ROLE_PRIORITY.get(r, 5))
+            cells = "、".join(f"R{m.get('reference')}={m.get('role')}" + (f"/{m.get('sub_role')}" if m.get("sub_role") else "")
+                             for m in members)
+            label = f"参考图集（格内标签：{cells}；逐格读取，不要画出拼版或标签）"
+        out[str(Path(path).resolve())] = (role, label)
+    return out
+
+
+def select_images(edit_base, references, manifest=None, *, repair=False, limit=MAX_EDIT_IMAGES):
+    """image[0] = edit base, then the references by priority, within ``limit``."""
+    labels = _labels_from_manifest(manifest)
+    base = str(Path(edit_base).resolve())
+    chosen = [(base, "camera" if not repair else "candidate",
+               "编辑画布（Blender 相机白模底图）" if not repair else "编辑画布（上一轮候选图：材质与灯光已基本满意）")]
+    rest = []
+    for order, ref in enumerate(references or []):
+        p = str(Path(ref).resolve())
+        if p == base or any(p == c[0] for c in chosen) or any(p == r[2] for r in rest):
+            continue
+        role, label = labels.get(p, ("camera" if order == 0 else "reference", ROLE_LABELS["camera"] if order == 0 else "参考图"))
+        rest.append((ROLE_PRIORITY.get(role, 5), order, p, role, label))
+    dropped = []
+    keep = sorted(rest, key=lambda r: (r[0], r[1]))
+    while len(keep) > limit - 1:
+        dropped.append(keep.pop())
+    keep.sort(key=lambda r: r[1])  # restore bundle order (camera, structure, product, ...)
+    chosen += [(p, role, label) for _pri, _o, p, role, label in keep]
+    return chosen, [(p, role) for _pri, _o, p, role, _l in dropped]
+
+
+def build_edit_prompt(prompt, images, *, mask=False, repair=False, correction=""):
+    lines = ["【Codex 图像编辑 · 在 Blender 画布上直接编辑】"]
+    if repair:
+        lines.append("图 1 是上一轮候选图，作为本次编辑画布；它的材质、光影与环境基本满意，只是产品构图有偏差。"
+                     "以图 2（Blender 相机白模）为几何与位置的唯一标准，把产品恢复到白模中的位置、尺度、视角与轮廓。")
+    else:
+        lines.append("图 1 是编辑画布（Blender 当前相机的白模画面），不是参考图。直接在图 1 上编辑，输出同一画布、同一机位、同一构图。")
+    lines.append("必须原样保持：产品的几何造型、画面中的位置、尺度、透视、朝向与轮廓剪影；相机机位、焦段观感、地平线与整体构图。"
+                 "禁止平移、缩放、裁切、旋转、换机位或重新设计产品造型。")
+    lines.append("只允许改变：材质与表面质感、灯光与阴影、反射、环境与背景、摄影质感——依据后面的参考图和要求。")
+    if mask:
+        lines.append("本次附带编辑 Mask：Mask 透明区域允许修改，不透明区域保持原样（Logo、字标、车牌等身份资产，或修复范围之外的画面）。")
+    lines.append("各图职责：")
+    for index, (_p, _role, label) in enumerate(images, start=1):
+        lines.append(f"- 图 {index}：{label}")
+    lines.append("参考图只提供外观信息（产品身份、环境光线与氛围），不得把参考图里的构图、机位、背景布局、拼版、分格线或文字画进结果。"
+                 "下文中的 Reference N / R N 是插件的逻辑参考编号，与上面的「图 N」不一定相同；Camera Base / Reference 1 指 Blender 白模。")
+    if correction:
+        lines.append("本轮纠偏：" + correction.strip())
+    lines.append("—— 渲染要求 ——")
+    lines.append((prompt or "").strip())
+    lines.append("只输出一张图。")
+    return "\n".join(lines)
+
+
+def build_payload(prompt, images, *, size, mask_path="", model="", quality="high", compat=False):
+    content = [{"type": "input_text", "text": prompt}]
+    summary = []
+    for index, (path, role, _label) in enumerate(images, start=1):
+        url, mime, nbytes = data_url(path)
+        content.append({"type": "input_image", "image_url": url})
+        summary.append({"index": index, "role": role, "file": Path(path).name, "mime": mime,
+                        "bytes": nbytes, "size": _image_size(path)})
+    tool = {"type": "image_generation", "output_format": "png", "size": size}
+    if not compat:
+        tool.update({"model": IMAGE_MODEL, "quality": quality, "background": "auto"})
+    if mask_path:
+        url, mime, nbytes = data_url(mask_path)
+        tool["input_image_mask"] = {"image_url": url}
+        summary.append({"mask": Path(mask_path).name, "mime": mime, "bytes": nbytes,
+                        "size": list(_png_size(mask_path) or [])})
+    payload = {
+        "model": (model or "").strip() or DEFAULT_MODEL,
+        "instructions": INSTRUCTIONS,
+        "input": [{"type": "message", "role": "user", "content": content}],
+        "tools": [tool],
+        "tool_choice": {"type": "image_generation"},
+        "parallel_tool_calls": False,
+        "store": False,
+        "stream": True,
+        "include": [],
+    }
+    return payload, summary
+
+
+def redact_payload(payload):
+    def walk(value):
+        if isinstance(value, dict):
+            return {k: walk(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v) for v in value]
+        if isinstance(value, str) and value.startswith("data:") and ";base64," in value:
+            head = value.split(",", 1)[0]
+            return f"{head},<{len(value)} chars>"
+        return value
+    return walk(payload)
+
+
+# --------------------------------------------------------------------------- transport
+
+def parse_sse_events(text_iter):
+    """Yield JSON events from an iterable of text lines (SSE or a single JSON body)."""
+    data_lines = []
+    for raw in text_iter:
+        line = raw.rstrip("\r\n")
+        if line == "":
+            if data_lines:
+                yield "\n".join(data_lines)
+                data_lines = []
+            continue
+        if line.startswith(":") or line.startswith("event:") or line.startswith("id:"):
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+        else:
+            data_lines.append(line)
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
+def extract_image(events):
+    """Return (b64, item, response_id) from Responses stream events."""
+    last_status, response_id = "", ""
+    for data in events:
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = str(event.get("type", ""))
+        if etype in {"response.failed", "response.incomplete", "error"}:
+            resp = event.get("response") if isinstance(event.get("response"), dict) else {}
+            err = resp.get("error") or event.get("error") or resp.get("incomplete_details") or event
+            code = str((err or {}).get("code") or (err or {}).get("type") or (err or {}).get("reason") or etype)
+            message = str((err or {}).get("message") or "")[:300]
+            kind = "quota" if ("usage_limit" in code or "quota" in code or "rate_limit" in code) else "server"
+            raise DirectEditError(f"图像编辑失败：{code} {message}".strip(), kind=kind)
+        items = []
+        if isinstance(event.get("item"), dict):
+            items.append(event["item"])
+        if etype == "response.completed" or "output" in event:
+            resp = event.get("response") if isinstance(event.get("response"), dict) else event
+            response_id = str(resp.get("id") or response_id)
+            if isinstance(resp.get("output"), list):
+                items.extend(i for i in resp["output"] if isinstance(i, dict))
+        for item in items:
+            if item.get("type") != "image_generation_call":
+                continue
+            last_status = str(item.get("status") or last_status)
+            result = item.get("result")
+            if isinstance(result, str) and result and last_status in {"completed", ""}:
+                return result, item, response_id
+            if isinstance(result, str) and result:
+                return result, item, response_id
+    raise DirectEditError("响应里没有图像结果" + (f"（最后状态 {last_status}）" if last_status else ""), kind="parse")
+
+
+def _line_iter(resp, cancel_check):
+    pending = b""
+    read = getattr(resp, "read1", None) or resp.read
+    while True:
+        if cancel_check and cancel_check():
+            raise DirectEditError("任务已取消", kind="cancelled", fatal=True)
+        chunk = read(65536)
+        if not chunk:
+            break
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            yield line.decode("utf-8", errors="replace")
+    if pending:
+        yield pending.decode("utf-8", errors="replace")
+
+
+def post_responses(url, headers, payload, *, timeout, cancel_check=None):
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    req = urlrequest.Request(url, data=body, headers=headers, method="POST")
+    holder = {}
+    stop = threading.Event()
+
+    def watch():  # cancellation closes the socket so a blocking read returns
+        while not stop.wait(0.5):
+            if cancel_check and cancel_check() and holder.get("resp") is not None:
+                try:
+                    holder["resp"].close()
+                except Exception:
+                    pass
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            holder["resp"] = resp
+            return extract_image(parse_sse_events(_line_iter(resp, cancel_check)))
+    except urlerror.HTTPError as exc:
+        try:
+            text = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+        raise _http_error(exc.code, text) from exc
+    except DirectEditError:
+        raise
+    except (urlerror.URLError, OSError, ValueError) as exc:
+        if cancel_check and cancel_check():
+            raise DirectEditError("任务已取消", kind="cancelled", fatal=True) from exc
+        reason = getattr(exc, "reason", exc)
+        raise DirectEditError(f"网络请求失败：{type(exc).__name__} {str(reason)[:120]}", kind="network") from exc
+    finally:
+        stop.set()
+
+
+def _http_error(status, text):
+    from .cli_transport import safe_diagnostic
+    snippet = safe_diagnostic(text or "")[:300]
+    lower = (text or "").lower()
+    if status in (401, 403):
+        return DirectEditError(f"HTTP {status}：登录无效或无权限", kind="auth", status=status, fatal=status == 403)
+    if status == 404:
+        return DirectEditError("HTTP 404：接口不存在或已变更", kind="endpoint", status=404, fatal=True, detail=snippet)
+    if status == 429:
+        quota = "usage_limit" in lower or "insufficient_quota" in lower or "out of credits" in lower
+        return DirectEditError(f"HTTP 429：{'额度已用完' if quota else '请求过于频繁'}", kind="quota" if quota else "rate_limit",
+                               status=429, fatal=quota)
+    if 400 <= status < 500:
+        return DirectEditError(f"HTTP {status}：请求被拒绝", kind="request", status=status, detail=snippet)
+    return DirectEditError(f"HTTP {status}：服务器错误", kind="server", status=status)
+
+
+# --------------------------------------------------------------------------- main entry
+
+def edit_image(*, prompt, edit_base_path, reference_paths, output_path, size, mask_path="", manifest=None,
+               repair=False, model="", client_version="", timeout=900, log_dir="", tag="",
+               cancel_check=None, correction=""):
+    """Edit ``edit_base_path`` (image 1) and save one PNG to ``output_path``."""
+    started = time.time()
+    if not edit_base_path or not Path(edit_base_path).is_file():
+        raise DirectEditError("编辑底图不存在", kind="input")
+    auth_path = find_auth_file()
+    if auth_path is None:
+        raise DirectEditError("未找到 Codex 登录文件（~/.codex/auth.json 或 CODEX_HOME）", kind="auth", fatal=True)
+    auth = load_auth(auth_path)
+    if token_expiring(access_token(auth)):
+        auth = refresh_auth(auth, auth_path)
+    images, dropped = select_images(edit_base_path, reference_paths, manifest, repair=repair)
+    log_root = Path(log_dir or Path(output_path).parent)
+    mask, mask_note = prepare_mask(mask_path, _png_size(images[0][0]), log_root)
+    text = build_edit_prompt(prompt, images, mask=bool(mask), repair=repair, correction=correction)
+    base = os.environ.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL
+    url = base.rstrip("/") + "/responses"
+    log = {"tag": tag, "url_host": re.sub(r"^(https?://[^/]+).*$", r"\1", url), "size": size,
+           "images": [], "dropped": [Path(p).name + f"({r})" for p, r in dropped], "mask_note": mask_note,
+           "attempts": []}
+    model_used = (model or "").strip() or DEFAULT_MODEL
+    variants = [dict(compat=False, model=model_used)]
+    if model_used != DEFAULT_MODEL:
+        variants.append(dict(compat=False, model=DEFAULT_MODEL))
+    variants.append(dict(compat=True, model=DEFAULT_MODEL))
+    refreshed = False
+    rate_waits = 0
+    result = None
+    last_exc = None
+    index = 0
+    try:
+        while index < len(variants):
+            opts = variants[index]
+            payload, summary = build_payload(text, images, size=size, mask_path=mask, model=opts["model"], compat=opts["compat"])
+            headers = auth_headers(auth, client_version)
+            log["images"] = summary
+            log["payload"] = redact_payload(payload)
+            log["headers"] = redact_headers(headers)
+            t0 = time.time()
+            try:
+                result = post_responses(url, headers, payload, timeout=timeout, cancel_check=cancel_check)
+                log["attempts"].append({"ok": True, "compat": opts["compat"], "model": opts["model"],
+                                        "seconds": round(time.time() - t0, 1)})
+                break
+            except DirectEditError as exc:
+                last_exc = exc
+                log["attempts"].append({"ok": False, "compat": opts["compat"], "model": opts["model"],
+                                        "kind": exc.kind, "status": exc.status, "error": str(exc)[:300],
+                                        "detail": getattr(exc, "detail", "")[:300],
+                                        "seconds": round(time.time() - t0, 1)})
+                if exc.kind == "cancelled":
+                    raise
+                if exc.kind == "auth" and exc.status == 401 and not refreshed:
+                    refreshed = True
+                    auth = refresh_auth(auth, auth_path)
+                    continue
+                if exc.kind == "rate_limit" and rate_waits < 2:
+                    rate_waits += 1
+                    time.sleep(min(30.0, 4.0 * rate_waits))
+                    continue
+                if exc.kind == "request" and index + 1 < len(variants):
+                    index += 1  # 400: try a leaner, more compatible payload
+                    continue
+                if exc.kind == "auth":
+                    exc.fatal = True
+                raise
+    finally:
+        log["seconds"] = round(time.time() - started, 1)
+        try:
+            log_root.mkdir(parents=True, exist_ok=True)
+            name = f"codex_direct_{tag}.json" if tag else "codex_direct.json"
+            (log_root / name).write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    b64, item, response_id = result
+    try:
+        data = base64.b64decode(b64, validate=False)
+    except (binascii.Error, ValueError) as exc:
+        raise DirectEditError("图像结果不是有效的 base64", kind="parse") from exc
+    if sniff_mime(data) == "application/octet-stream":
+        raise DirectEditError("图像结果无法识别", kind="parse")
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    from .composition import image_dimensions
+    return {
+        "engine": "codex_direct_edit",
+        "status": "ok",
+        "source": str(target),
+        "attached_images": len(images),
+        "image_roles": [role for _p, role, _l in images],
+        "dropped_images": [r for _p, r in dropped],
+        "mask": bool(mask),
+        "mask_note": mask_note,
+        "size_requested": size,
+        "size_returned": list(image_dimensions(target) or []),
+        "model": log["attempts"][-1]["model"] if log["attempts"] else model_used,
+        "compat_payload": bool(log["attempts"] and log["attempts"][-1].get("compat")),
+        "response_id": response_id,
+        "revised_prompt": str(item.get("revised_prompt") or "")[:500],
+        "seconds": round(time.time() - started, 1),
+    }
+
+
+def short_reason(exc) -> str:
+    text = str(exc)
+    return text if len(text) <= 60 else text[:58] + "…"
+
+
+def generate_with_fallback(kwargs, *, fallback, state, size, manifest=None, bundle_note="",
+                           client_version="", on_status=None, cancel_check=None):
+    """Try the direct edit; on any failure log it and run ``fallback(**kwargs)`` (codex exec).
+
+    ``state`` is a per-render dict: once a fatal error happens (auth, endpoint),
+    direct edit is skipped for the remaining variants/attempts of this render.
+    """
+    state.setdefault("direct_ok", 0)
+    state.setdefault("fallbacks", 0)
+    state.setdefault("disabled", "")
+    state.setdefault("errors", [])
+    edit_base = kwargs.get("edit_base_path") or (list(kwargs.get("reference_paths") or [""])[0])
+    references = list(kwargs.get("reference_paths") or [])
+    repair = bool(edit_base and references and Path(edit_base).resolve() != Path(references[0]).resolve())
+    if not state["disabled"]:
+        prompt = kwargs.get("prompt", "")
+        if bundle_note:
+            prompt = prompt.replace(bundle_note, "")
+        out = Path(kwargs["output_path"])
+        try:
+            result = edit_image(
+                prompt=prompt, edit_base_path=edit_base, reference_paths=references,
+                output_path=str(out), size=size, mask_path=kwargs.get("edit_mask_path", ""),
+                manifest=manifest, repair=repair, model=kwargs.get("model", ""),
+                client_version=client_version, timeout=max(60, int(kwargs.get("timeout") or 900) or 900),
+                log_dir=kwargs.get("cwd", ""), tag=out.stem, cancel_check=cancel_check,
+            )
+            state["direct_ok"] += 1
+            return result
+        except DirectEditError as exc:
+            if exc.kind == "cancelled":
+                raise RuntimeError("任务已取消") from exc
+            reason = short_reason(exc)
+            state["errors"].append({"kind": exc.kind, "status": exc.status, "message": str(exc)[:300],
+                                    "detail": getattr(exc, "detail", "")[:300]})
+            if exc.fatal:
+                state["disabled"] = reason
+            state["last_reason"] = reason
+            print(f"[Wondful] Codex 直连图像编辑失败，改用 codex exec：{reason}")
+            if on_status:
+                try:
+                    on_status(f"直连编辑失败（{reason}），改用 Codex 代理生成")
+                except Exception:
+                    pass
+        except Exception as exc:  # never let an unexpected bug block rendering
+            reason = short_reason(f"{type(exc).__name__}: {exc}")
+            state["errors"].append({"kind": "bug", "message": reason})
+            state["disabled"] = reason
+            state["last_reason"] = reason
+            print(f"[Wondful] Codex 直连图像编辑异常，改用 codex exec：{reason}")
+    state["fallbacks"] += 1
+    result = fallback(**kwargs)
+    if isinstance(result, dict):
+        result = dict(result)
+        result["direct_fallback_reason"] = state.get("last_reason") or state.get("disabled") or ""
+    return result
+
+
+def engine_note(state) -> str:
+    """One short panel line describing which path produced the images."""
+    if not state:
+        return ""
+    ok, fb = int(state.get("direct_ok", 0)), int(state.get("fallbacks", 0))
+    reason = state.get("disabled") or state.get("last_reason") or ""
+    if ok and not fb:
+        return "生图：Codex 图像编辑（直连）"
+    if fb and not ok:
+        return f"直连编辑不可用（{reason}），已自动改用 Codex 代理生成" if reason else "已使用 Codex 代理生成"
+    if ok and fb:
+        return f"直连 {ok} 次，{fb} 次改用 Codex 代理生成（{reason}）"
+    return ""

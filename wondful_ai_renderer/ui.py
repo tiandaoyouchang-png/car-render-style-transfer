@@ -368,7 +368,7 @@ def _draw_progress_bar(layout, props, text):
 
 
 class WONDFUL_PT_main(Panel):
-    bl_label = "Wondful AI 渲染器 · 3.2.0"
+    bl_label = "Wondful AI 渲染器 · 3.2.1"
     bl_idname = "WONDFUL_PT_main"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -596,6 +596,11 @@ class WONDFUL_PT_main(Panel):
                 result.label(text=f"已完成 {exported_count}/{provider_variant_count} 张，继续生成中", icon="TIME")
             elif exported_count > 1:
                 result.label(text=f"共 {exported_count} 张，预览为最佳一张", icon="INFO")
+            engine_note = getattr(props, "last_engine_note", "")
+            if engine_note:
+                fell_back = "改用" in engine_note
+                for index, line in enumerate(wrap(engine_note, width=42)[:2]):
+                    result.label(text=line, icon=("ERROR" if fell_back else "CHECKMARK") if index == 0 else "BLANK1")
             again = result.row(align=True)
             again.scale_y = 1.4
             again.enabled = not busy
@@ -634,7 +639,12 @@ class WONDFUL_PT_main(Panel):
         msg = getattr(props, model_provider + "_models_message")
         if msg:
             ai.label(text=msg[:90])
-        ai.label(text="生图：" + ("AGY generate_image" if active_is_antigravity else "Codex ImageGen") + "（由 CLI 管理）")
+        if active_is_antigravity:
+            ai.label(text="生图：AGY generate_image（由 CLI 管理）")
+        else:
+            ai.prop(prefs, "codex_direct_edit", text="图像编辑直连：在白模画布上直接编辑（推荐）")
+            ai.label(text=("生图：Codex 图像编辑（直连，失败自动改用 CLI）" if getattr(prefs, "codex_direct_edit", True)
+                           else "生图：Codex ImageGen（由 CLI 管理）"))
         acct = ai.row(align=True)
         acct.operator(refresh_op, text="检测登录", icon="FILE_REFRESH")
         if connected and not active_is_antigravity:
@@ -700,6 +710,8 @@ class WONDFUL_PT_main(Panel):
                     info.label(text=line)
             if props.last_structure_note:
                 info.label(text=props.last_structure_note[:100])
+            if getattr(props, "last_engine_note", ""):
+                info.label(text=props.last_engine_note[:100])
             if props.last_total_seconds > 0:
                 info.label(text=f"总用时 {props.last_total_seconds:.0f}s · 生图 {props.last_generation_seconds:.0f}s · 验收 {props.last_audit_seconds:.0f}s")
             if getattr(props, "active_conversation_id", ""):

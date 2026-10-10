@@ -175,6 +175,12 @@ class WONDFUL_AddonPreferences(AddonPreferences):
         description="通过 ChatGPT OAuth 的 Codex 会话调用内置 image generation；当前 Codex 版本/账号可能不暴露该工具",
         default=True,
     )
+    codex_direct_edit: BoolProperty(
+        name="Codex 图像编辑（直连）",
+        description="在 Blender 白模画布上直接调用 Codex 图像编辑（复用 Codex 的 ChatGPT 登录，无需 API Key），"
+                    "产品形状、位置和尺度更稳；失败时自动改用 Codex 代理生成",
+        default=True,
+    )
     codex_polish_timeout: IntProperty(
         name="Codex 润色超时（秒）",
         description="Codex AI 润色允许的最长总运行时间；复杂多图任务可能需要数分钟。0 表示不设置插件侧硬超时",
@@ -284,7 +290,8 @@ class WONDFUL_AddonPreferences(AddonPreferences):
         layout = self.layout
         info = layout.box()
         info.label(text="无需 OpenAI / Google / DeepSeek / Seedream API Key。", icon="INFO")
-        info.label(text="Codex 复用 ChatGPT OAuth；Antigravity 复用 Google Keychain / OAuth。插件不读取或保存 Token。")
+        info.label(text="Codex 复用 ChatGPT OAuth；Antigravity 复用 Google Keychain / OAuth。插件不保存、不记录 Token。")
+        info.label(text="图像编辑直连会读取 Codex 的 auth.json 登录信息，令牌过期时按 Codex 方式刷新并写回。")
 
         codex = layout.box()
         codex.label(text="Codex", icon="CONSOLE")
@@ -303,6 +310,7 @@ class WONDFUL_AddonPreferences(AddonPreferences):
         col = layout.column(align=True)
         col.prop(self, "long_edge")
         col.prop(self, "codex_imagegen_enabled")
+        col.prop(self, "codex_direct_edit")
         col.prop(self, "antigravity_imagegen_enabled")
         col.prop(self, "codex_polish_timeout")
         col.prop(self, "codex_audit_timeout")
@@ -627,6 +635,11 @@ class WONDFUL_AISettings(PropertyGroup):
     )
     last_capture_method: StringProperty(default="")
     last_canvas_warning: StringProperty(default="")
+    last_engine_note: StringProperty(
+        name="生图通道",
+        description="上次渲染实际使用的生图通道（直连图像编辑 / Codex 代理生成）",
+        default="",
+    )
     last_canvas_fit: BoolProperty(
         name="比例已适配",
         description="结果已按比例缩放并留边到白模画布，未裁切、未拉伸",

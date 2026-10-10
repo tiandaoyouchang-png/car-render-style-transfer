@@ -41,8 +41,9 @@ class CardUITests(unittest.TestCase):
 
     def test_version(self):
         init = (PKG / "__init__.py").read_text()
-        self.assertIn('"version": (3, 2, 0)', init)
-        self.assertIn("3.2.0", self.src)
+        # Bumped with each release (3.2.1: direct image edit).
+        self.assertIn('"version": (3, 2, 1)', init)
+        self.assertIn("3.2.1", self.src)
 
 
 if __name__ == "__main__":

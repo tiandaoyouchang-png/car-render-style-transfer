@@ -1,11 +1,11 @@
-"""Headless panel draw check (3.2.0).
+"""Headless panel draw check (3.2.0; 3.2.1 adds direct-edit result states).
 
 Installs the release ZIP, enables it, then draws WONDFUL_PT_main against a
 strict recording layout in several panel states. Every layout call is checked
 against Blender's real RNA: function/keyword names, icon names, property names,
 operator idnames and operator property names. Exits non-zero on any problem.
 
-    blender -b --factory-startup --python tools/ui_draw_check.py -- dist/Wondful-AI-Renderer-Blender-3.2.0.zip
+    blender -b --factory-startup --python tools/ui_draw_check.py -- dist/Wondful-AI-Renderer-Blender-3.2.1.zip
 """
 import sys
 import traceback
@@ -194,6 +194,14 @@ def main():
     props.result_image = make_image("result.png", (0.5, 0.6, 0.7, 1))
     props.alignment_score = 92
     draw("result")
+    props.last_engine_note = "生图：Codex 图像编辑（直连）"
+    draw("result_direct_edit")
+    props.last_engine_note = "直连编辑不可用（HTTP 404：接口不存在或已变更），已自动改用 Codex 代理生成"
+    draw("result_direct_fallback")
+    prefs = bpy.context.preferences.addons["wondful_ai_renderer"].preferences
+    prefs.codex_direct_edit = False
+    draw("result_direct_off")
+    prefs.codex_direct_edit = True
 
     # 5. error + antigravity provider + authenticating
     props.status = "ERROR"
